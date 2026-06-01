@@ -1,0 +1,1 @@
+# RegisterABot interface package

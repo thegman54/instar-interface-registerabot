@@ -1,0 +1,43 @@
+# =============================================================================
+# REGISTERABOT INTERFACE TOOL STACK
+#
+# Connects to RegisterABot relay via WebSocket as a bot.
+# Receives messages from services/visitors, routes through gatekeeper and bot.
+# Secrets (REGISTERABOT_*) fetched from Infisical at startup.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # REGISTERABOT API - WebSocket listener + message router
+  # ---------------------------------------------------------------------------
+  api:
+    build: .
+    container_name: registerabot-api
+    environment:
+      - INFISICAL_URL=http://infisical:8080
+      - INFISICAL_TOKEN=${INFISICAL_TOKEN}
+      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID}
+      - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-prod}
+      - GATEKEEPER_URL=${GATEKEEPER_URL:-http://gatekeeper:8080}
+      - BOT_SERVICE_URL=${BOT_SERVICE_URL:-http://bot:8080}
+      - PORT=8091
+    ports:
+      - "8091:8091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - instar-internal
+      - instar-network
+      - instar-bot
+
+networks:
+  instar-internal:
+    external: true
+  instar-network:
+    external: true
+  instar-bot:
+    external: true
