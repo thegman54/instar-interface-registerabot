@@ -206,6 +206,11 @@ async def handle_message(envelope: dict, ws) -> None:
                     await send_response(ws, envelope, f"Tools now available: {tools}. What would you like to do?")
                 return
 
+            # Gatekeeper short-circuit (e.g. no tools available)
+            if gk_data.get('response'):
+                await send_response(ws, envelope, gk_data['response'])
+                return
+
             # 2. Call bot service with cleaned message
             bot_response = await client.post(
                 f"{BOT_SERVICE_URL}/chat",
