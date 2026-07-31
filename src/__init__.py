@@ -1,1 +1,1 @@
-# RegisterABot interface package
+# RegisterABot interface tool

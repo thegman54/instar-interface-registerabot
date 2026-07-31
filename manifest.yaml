@@ -3,6 +3,7 @@ display_name: RegisterABot
 description: BYOA relay — WebSocket connection to RegisterABot service
 version: "1.0"
 type: interface
+tenancy: multi_tenant
 connection:
   pattern: websocket
   port: 8091
@@ -11,3 +12,12 @@ credentials:
   - REGISTERABOT_RELAY_URL
   - REGISTERABOT_BOT_SLUG
   - REGISTERABOT_API_KEY
+binding_fields:
+  - name: bot_slug
+    label: Bot Slug
+    type: text
+    required: true
+  - name: api_key
+    label: API Key
+    type: password
+    required: true
