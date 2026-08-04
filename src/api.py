@@ -60,6 +60,13 @@ RELAY_URL = os.environ.get('REGISTERABOT_RELAY_URL', '')
 LEGACY_BOT_SLUG = os.environ.get('REGISTERABOT_BOT_SLUG', '')
 LEGACY_API_KEY = os.environ.get('REGISTERABOT_API_KEY', '')
 
+# Host mode (preferred): ONE socket to /ws/host/:account carries all our bots. When these are
+# set, connect(slug)/disconnect(slug) become attach/detach on that socket instead of a per-bot
+# WS. See registerabot docs/HOST-CONNECTION-PROTOCOL.md.
+ACCOUNT_ID = os.environ.get('REGISTERABOT_ACCOUNT_ID', '')
+ACCOUNT_KEY = os.environ.get('REGISTERABOT_ACCOUNT_KEY', '')
+HOST_MODE = bool(RELAY_URL and ACCOUNT_ID and ACCOUNT_KEY)
+
 # Upper bound the connector waits for a bot turn. The REAL budget is per-profile and
 # enforced by the gatekeeper (which returns within it); this ceiling just has to exceed
 # the largest profile timeout so httpx never throws ReadTimeout before the gatekeeper replies.
@@ -683,21 +690,151 @@ class SlugConnection:
         }
 
 
+class HostConnection:
+    """ONE WebSocket to the relay /ws/host/:account carrying MANY of our owned bots.
+
+    connect(slug)/disconnect(slug) become attach/detach control frames; inbound envelopes are
+    demuxed by to.slug into handle_message (which is already slug-keyed). Auto-reconnects and
+    re-attaches everything it believes it's serving. See docs/HOST-CONNECTION-PROTOCOL.md.
+    """
+
+    def __init__(self, account_id: str, account_key: str, relay_url: str):
+        self.account_id = account_id
+        self.account_key = account_key
+        self.relay_url = relay_url
+        self.ws: websockets.WebSocketClientProtocol | None = None
+        self.attached: set[str] = set()
+        self.connected: bool = False
+        self.connected_since: float | None = None
+        self._task: asyncio.Task | None = None
+        self._shutdown: bool = False
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._loop())
+            self._task.add_done_callback(_log_task_exception)
+
+    async def stop(self) -> None:
+        self._shutdown = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+    def attach(self, slug: str) -> bool:
+        if slug in self.attached:
+            return False
+        self.attached.add(slug)
+        if self.connected and self.ws:
+            asyncio.create_task(self._send({'type': 'attach', 'slugs': [slug]}))
+        log.info("host_attach", slug=slug)
+        return True
+
+    def detach(self, slug: str) -> bool:
+        if slug not in self.attached:
+            return False
+        self.attached.discard(slug)
+        if self.connected and self.ws:
+            asyncio.create_task(self._send({'type': 'detach', 'slugs': [slug]}))
+        log.info("host_detach", slug=slug)
+        return True
+
+    def is_attached(self, slug: str) -> bool:
+        return slug in self.attached
+
+    async def _send(self, obj: dict) -> None:
+        try:
+            if self.ws:
+                await self.ws.send(json.dumps(obj))
+        except Exception as e:
+            log.debug("host_send_failed", error=str(e))
+
+    async def _loop(self) -> None:
+        while not self._shutdown:
+            try:
+                ws_url = f"{self.relay_url}/ws/host/{self.account_id}?key={self.account_key}"
+                log.info("host_connecting", url=self.relay_url, account=self.account_id)
+                async with websockets.connect(
+                    ws_url, ping_interval=20, ping_timeout=90, close_timeout=10,
+                ) as ws:
+                    self.ws = ws
+                    self.connected = True
+                    self.connected_since = time.time()
+                    if self.attached:  # re-attach after a reconnect
+                        await self._send({'type': 'attach', 'slugs': sorted(self.attached)})
+                    log.info("host_connected", serving=len(self.attached))
+
+                    async for raw in ws:
+                        if self._shutdown:
+                            break
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            log.warning("host_invalid_json", raw=raw[:200])
+                            continue
+                        mtype = data.get('type', '')
+                        if mtype == 'chat_request':
+                            slug = (data.get('to') or {}).get('slug')
+                            if not slug:
+                                log.warning("host_msg_no_slug")
+                                continue
+                            task = asyncio.create_task(handle_message(data, ws, slug))
+                            task.add_done_callback(_log_task_exception)
+                        elif mtype == 'attached':
+                            log.info("host_attached", ok=data.get('ok'), denied=data.get('denied'))
+                        elif mtype == 'error':
+                            log.warning("host_error", code=data.get('code'), slug=data.get('slug'))
+                        elif mtype == 'pong':
+                            pass
+                        elif 'error' in data:
+                            log.warning("host_relay_error", error=data.get('error'))
+            except asyncio.CancelledError:
+                break
+            except websockets.ConnectionClosed as e:
+                log.warning("host_disconnected", code=e.code, reason=e.reason)
+            except Exception as e:
+                log.error("host_error_unexpected", error=str(e))
+                import traceback
+                traceback.print_exc()
+            finally:
+                self.ws = None
+                self.connected = False
+                self.connected_since = None
+            if not self._shutdown:
+                log.info("host_reconnecting", delay=RECONNECT_DELAY)
+                await asyncio.sleep(RECONNECT_DELAY)
+
+
 class ConnectionManager:
     """
-    Manages multiple simultaneous WebSocket connections to the RegisterABot relay.
+    Manages WebSocket connection(s) to the RegisterABot relay.
 
-    Each bot_slug gets its own persistent WS connection with auto-reconnect.
-    Gatekeeper calls connect/disconnect on profile launch/stop.
+    HOST_MODE (preferred): one shared host socket carries all bots — connect/disconnect a slug
+    become attach/detach. Legacy: each bot_slug gets its own WS. Gatekeeper calls
+    connect/disconnect on profile launch/stop either way.
     """
 
     def __init__(self):
         self._connections: dict[str, SlugConnection] = {}
+        self._host: HostConnection | None = (
+            HostConnection(ACCOUNT_ID, ACCOUNT_KEY, RELAY_URL) if HOST_MODE else None
+        )
+
+    def start_host(self) -> None:
+        if self._host:
+            self._host.start()
 
     def connect(self, slug: str, api_key: str, relay_url: str) -> bool:
         """
-        Start a WS connection for a bot slug. Returns False if already connected.
+        Bring a bot slug online. Host mode: attach on the shared socket. Legacy: new WS.
+        Returns False if already online.
         """
+        if self._host:
+            return self._host.attach(slug)   # account key authenticates; per-bot api_key unused
+
         if slug in self._connections and not self._connections[slug]._shutdown:
             return False
 
@@ -711,8 +848,11 @@ class ConnectionManager:
 
     def disconnect(self, slug: str) -> bool:
         """
-        Stop the WS connection for a bot slug. Returns False if not connected.
+        Take a bot slug offline. Host mode: detach. Legacy: close its WS. False if not online.
         """
+        if self._host:
+            return self._host.detach(slug)
+
         conn = self._connections.pop(slug, None)
         if not conn:
             return False
@@ -727,15 +867,24 @@ class ConnectionManager:
         return True
 
     def list_connections(self) -> list[dict]:
-        """List all connections and their status."""
+        """List all bots and their status."""
+        if self._host:
+            up = int(time.time() - self._host.connected_since) if self._host.connected_since else None
+            return [{'slug': s, 'connected': self._host.connected, 'via': 'host', 'uptime_seconds': up}
+                    for s in sorted(self._host.attached)]
         return [conn.to_dict() for conn in self._connections.values()]
 
     def is_connected(self, slug: str) -> bool:
+        if self._host:
+            return self._host.connected and self._host.is_attached(slug)
         conn = self._connections.get(slug)
         return conn.connected if conn else False
 
     async def shutdown_all(self):
-        """Disconnect all slugs (on app shutdown)."""
+        """Disconnect all bots (on app shutdown)."""
+        if self._host:
+            await self._host.stop()
+            return
         slugs = list(self._connections.keys())
         for slug in slugs:
             self.disconnect(slug)
@@ -818,8 +967,15 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
     log.info("registerabot_api_starting")
 
-    # Legacy single-bot mode: if env vars are set, auto-connect
-    if RELAY_URL and LEGACY_BOT_SLUG and LEGACY_API_KEY:
+    if HOST_MODE:
+        # One shared socket for all bots; gatekeeper attaches slugs via /slugs/{slug}/connect
+        # as profiles launch. Start it now (idle until the first attach).
+        connection_manager.start_host()
+        log.info("host_mode_started", account=ACCOUNT_ID)
+        if LEGACY_BOT_SLUG:
+            connection_manager.connect(LEGACY_BOT_SLUG, LEGACY_API_KEY, RELAY_URL)
+    elif RELAY_URL and LEGACY_BOT_SLUG and LEGACY_API_KEY:
+        # Legacy single-bot mode: one WS per bot
         connection_manager.connect(
             slug=LEGACY_BOT_SLUG,
             api_key=LEGACY_API_KEY,
