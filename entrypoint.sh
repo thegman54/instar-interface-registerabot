@@ -3,7 +3,7 @@
 
 if [ -n "$INFISICAL_URL" ] && [ -n "$INFISICAL_TOKEN" ] && [ -n "$INFISICAL_PROJECT_ID" ]; then
     echo "Fetching secrets from Infisical..."
-    python3 /app/fetch_secrets.py REGISTERABOT_RELAY_URL REGISTERABOT_BOT_SLUG REGISTERABOT_API_KEY > /tmp/.secrets 2>/tmp/.secrets_err
+    python3 /app/fetch_secrets.py REGISTERABOT_RELAY_URL REGISTERABOT_BOT_SLUG REGISTERABOT_API_KEY REGISTERABOT_ACCOUNT_ID REGISTERABOT_ACCOUNT_KEY > /tmp/.secrets 2>/tmp/.secrets_err
 
     if [ -s /tmp/.secrets ]; then
         while IFS= read -r line; do

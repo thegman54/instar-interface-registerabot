@@ -12,6 +12,10 @@ credentials:
   - REGISTERABOT_RELAY_URL
   - REGISTERABOT_BOT_SLUG
   - REGISTERABOT_API_KEY
+  # Host mode: one socket carries all our bots. When both are present the adapter connects to
+  # /ws/host/:account and attach/detaches slugs instead of one WS per bot.
+  - REGISTERABOT_ACCOUNT_ID
+  - REGISTERABOT_ACCOUNT_KEY
 binding_fields:
   - name: bot_slug
     label: Bot Slug
