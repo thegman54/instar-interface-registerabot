@@ -67,6 +67,10 @@ ACCOUNT_ID = os.environ.get('REGISTERABOT_ACCOUNT_ID', '')
 ACCOUNT_KEY = os.environ.get('REGISTERABOT_ACCOUNT_KEY', '')
 HOST_MODE = bool(RELAY_URL and ACCOUNT_ID and ACCOUNT_KEY)
 
+# Application-level ping on the host control channel. The WS library's own ping proves the
+# socket is open; this proves the RELAY is still answering us. Stale pong => routing suspect.
+HOST_PING_SECONDS = int(os.environ.get('REGISTERABOT_HOST_PING_SECONDS', '30'))
+
 # Upper bound the connector waits for a bot turn. The REAL budget is per-profile and
 # enforced by the gatekeeper (which returns within it); this ceiling just has to exceed
 # the largest profile timeout so httpx never throws ReadTimeout before the gatekeeper replies.
@@ -703,10 +707,17 @@ class HostConnection:
         self.account_key = account_key
         self.relay_url = relay_url
         self.ws: websockets.WebSocketClientProtocol | None = None
+        # DESIRED vs CONFIRMED. `attached` is what we've been asked to serve; `confirmed` is
+        # what the relay actually ACKed. They can diverge — the relay can DENY a slug — and
+        # when that happened we reported connected:true for 17 hours while every message for
+        # that bot was black-holed. Never report health from `attached` alone.
         self.attached: set[str] = set()
+        self.confirmed: set[str] = set()
         self.connected: bool = False
         self.connected_since: float | None = None
+        self.last_pong: float | None = None
         self._task: asyncio.Task | None = None
+        self._ping_task: asyncio.Task | None = None
         self._shutdown: bool = False
 
     def start(self) -> None:
@@ -725,25 +736,35 @@ class HostConnection:
                 pass
 
     def attach(self, slug: str) -> bool:
-        if slug in self.attached:
-            return False
+        """Ask the relay to route `slug` to us.
+
+        Re-sends the attach frame whenever the slug isn't CONFIRMED, even if we already
+        wanted it. That's what makes the gatekeeper's 60s keepalive self-healing: previously
+        this returned early on `slug in self.attached`, so once an attach was denied nothing
+        ever retried it and the bot stayed silently unreachable.
+        """
+        already = slug in self.attached
         self.attached.add(slug)
+        if already and slug in self.confirmed:
+            return False
         if self.connected and self.ws:
             asyncio.create_task(self._send({'type': 'attach', 'slugs': [slug]}))
-        log.info("host_attach", slug=slug)
-        return True
+        log.info("host_attach", slug=slug, retry=already)
+        return not already
 
     def detach(self, slug: str) -> bool:
         if slug not in self.attached:
             return False
         self.attached.discard(slug)
+        self.confirmed.discard(slug)
         if self.connected and self.ws:
             asyncio.create_task(self._send({'type': 'detach', 'slugs': [slug]}))
         log.info("host_detach", slug=slug)
         return True
 
     def is_attached(self, slug: str) -> bool:
-        return slug in self.attached
+        """Routing-truth, not intent: only a relay-CONFIRMED slug counts as reachable."""
+        return slug in self.confirmed
 
     async def _send(self, obj: dict) -> None:
         try:
@@ -751,6 +772,49 @@ class HostConnection:
                 await self.ws.send(json.dumps(obj))
         except Exception as e:
             log.debug("host_send_failed", error=str(e))
+
+    async def _ping_loop(self) -> None:
+        """Account-channel heartbeat + per-slug ROUTING reconciliation.
+
+        The ping alone proves only that the relay answers us on the host socket — it would
+        have stayed green through the whole 2026-08-09 outage, because that socket was fine
+        and it was the per-slug binding that was broken. So the useful half is `slugs`: the
+        relay reports which slugs it can actually serve, and we compare that to what we
+        believe we're serving. Any slug we want but the relay doesn't list gets re-attached
+        automatically — the exact repair that previously needed a manual detach/attach.
+        """
+        while not self._shutdown and self.connected:
+            try:
+                await asyncio.sleep(HOST_PING_SECONDS)
+                if not (self.connected and self.ws):
+                    return
+                await self._send({'type': 'ping', 'ts': int(time.time() * 1000)})
+                await self._send({'type': 'slugs'})
+                if self.pong_age() is not None and self.pong_age() > HOST_PING_SECONDS * 3:
+                    log.warning("host_pong_stale", seconds=int(self.pong_age()),
+                                note="relay not answering pings; routing is suspect")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.debug("host_ping_failed", error=str(e))
+
+    async def _reconcile(self, relay_slugs: list) -> None:
+        """Relay's view is authoritative. Re-attach anything we want that it isn't serving."""
+        relay = set(relay_slugs or [])
+        self.confirmed = self.attached & relay
+        missing = self.attached - relay
+        if missing:
+            log.warning("host_routing_drift", missing=sorted(missing),
+                        note="relay is not serving slugs we believe we serve; re-attaching")
+            await self._send({'type': 'attach', 'slugs': sorted(missing)})
+
+    def pong_age(self) -> float | None:
+        return None if self.last_pong is None else time.time() - self.last_pong
+
+    def healthy(self) -> bool:
+        """Connected AND the relay is still answering on the control channel."""
+        age = self.pong_age()
+        return bool(self.connected) and (age is None or age <= HOST_PING_SECONDS * 3)
 
     async def _loop(self) -> None:
         while not self._shutdown:
@@ -763,9 +827,15 @@ class HostConnection:
                     self.ws = ws
                     self.connected = True
                     self.connected_since = time.time()
+                    self.last_pong = time.time()
+                    # A new socket confirms NOTHING until the relay ACKs the re-attach.
+                    self.confirmed.clear()
                     if self.attached:  # re-attach after a reconnect
                         await self._send({'type': 'attach', 'slugs': sorted(self.attached)})
                     log.info("host_connected", serving=len(self.attached))
+                    if self._ping_task is None or self._ping_task.done():
+                        self._ping_task = asyncio.create_task(self._ping_loop())
+                        self._ping_task.add_done_callback(_log_task_exception)
 
                     async for raw in ws:
                         if self._shutdown:
@@ -784,11 +854,30 @@ class HostConnection:
                             task = asyncio.create_task(handle_message(data, ws, slug))
                             task.add_done_callback(_log_task_exception)
                         elif mtype == 'attached':
-                            log.info("host_attached", ok=data.get('ok'), denied=data.get('denied'))
+                            ok = data.get('ok') or []
+                            denied = data.get('denied') or []
+                            # ACT on the reply, don't just log it. A denied slug must leave
+                            # `confirmed` so /status stops claiming it's reachable, and must
+                            # stay in `attached` so the keepalive keeps retrying it.
+                            self.confirmed.update(ok)
+                            self.confirmed.difference_update(denied)
+                            if denied:
+                                log.warning("host_attach_denied", denied=denied,
+                                            note="relay refused these slugs; keepalive will retry")
+                            log.info("host_attached", ok=ok, denied=denied,
+                                     confirmed=sorted(self.confirmed))
                         elif mtype == 'error':
-                            log.warning("host_error", code=data.get('code'), slug=data.get('slug'))
+                            # An error naming a slug means we can no longer trust its routing.
+                            slug = data.get('slug')
+                            if slug:
+                                self.confirmed.discard(slug)
+                            log.warning("host_error", code=data.get('code'), slug=slug)
                         elif mtype == 'pong':
-                            pass
+                            self.last_pong = time.time()
+                        elif mtype == 'slugs':
+                            # Routing truth from the relay — reconcile against our intent.
+                            self.last_pong = time.time()
+                            await self._reconcile(data.get('attached') or [])
                         elif 'error' in data:
                             log.warning("host_relay_error", error=data.get('error'))
             except asyncio.CancelledError:
@@ -867,11 +956,28 @@ class ConnectionManager:
         return True
 
     def list_connections(self) -> list[dict]:
-        """List all bots and their status."""
+        """List all bots and their status.
+
+        `connected` now means RELAY-CONFIRMED routing, not 'we asked for it' — the old
+        version read self._host.attached, which is intent, so a slug the relay had denied
+        still showed connected:true. `attach_requested` keeps the intent visible, and
+        pong_age_seconds distinguishes a live control channel from a merely-open socket.
+        """
         if self._host:
-            up = int(time.time() - self._host.connected_since) if self._host.connected_since else None
-            return [{'slug': s, 'connected': self._host.connected, 'via': 'host', 'uptime_seconds': up}
-                    for s in sorted(self._host.attached)]
+            h = self._host
+            up = int(time.time() - h.connected_since) if h.connected_since else None
+            age = h.pong_age()
+            return [{
+                'slug': s,
+                'connected': h.connected and s in h.confirmed,
+                'attach_requested': True,
+                'relay_confirmed': s in h.confirmed,
+                'socket_connected': h.connected,
+                'via': 'host',
+                'uptime_seconds': up,
+                'pong_age_seconds': None if age is None else int(age),
+                'healthy': h.healthy() and s in h.confirmed,
+            } for s in sorted(h.attached)]
         return [conn.to_dict() for conn in self._connections.values()]
 
     def is_connected(self, slug: str) -> bool:
