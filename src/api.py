@@ -145,6 +145,29 @@ def extract_user_context_from_envelope(envelope: dict) -> dict:
     return uc if isinstance(uc, dict) else {}
 
 
+def extract_assertion_from_envelope(envelope: dict) -> str:
+    """Pull the signed AI action assertion, if the sender attached one.
+
+    Deliberately SEPARATE from user_context. user_context is forwarded into the bot's
+    prompt, and this is a live credential: anything in the prompt can be quoted back,
+    summarised, or talked out of the model. It is handed to the gatekeeper as its own
+    field, bound to the session, and re-attached by the tool executor at call time — the
+    bot acts under it without ever holding it, exactly as it never holds an API key.
+    """
+    payload_raw = envelope.get('payload')
+    if isinstance(payload_raw, str):
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get('assertion'), str):
+            return payload['assertion']
+    elif isinstance(payload_raw, dict) and isinstance(payload_raw.get('assertion'), str):
+        return payload_raw['assertion']
+    a = envelope.get('assertion')
+    return a if isinstance(a, str) else ''
+
+
 def build_response_envelope(
     original_envelope: dict,
     bot_slug: str,
@@ -416,6 +439,7 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     session_id = envelope.get('session_id', '')
     messages, source_info = extract_messages_from_envelope(envelope)
     user_context = extract_user_context_from_envelope(envelope)
+    assertion = extract_assertion_from_envelope(envelope)
 
     if not messages:
         log.warning("empty_message", session=session_id, source=source_info, bot=bot_slug)
@@ -469,6 +493,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
             }
             if user_context:
                 gk_body['user_context'] = user_context
+            if assertion:
+                # Session-bound credential, never merged into user_context (see
+                # extract_assertion_from_envelope) so it stays out of the bot's prompt.
+                gk_body['assertion'] = assertion
             if attachments:
                 gk_body['attachments'] = attachments
 
