@@ -694,6 +694,29 @@ class SlugConnection:
         }
 
 
+def _slugset(items) -> set[str]:
+    """Normalize a relay slug list to a set of slug strings.
+
+    The relay sends slugs in two shapes depending on the field: bare strings
+    ("hal") and objects carrying a reason ({"slug": "hal", "reason": "..."}).
+    Feeding the object form straight into a set raises
+    `TypeError: unhashable type: 'dict'`, which — raised inside the message
+    loop — killed the whole host socket and put every bot into a permanent
+    reconnect cycle with no messages delivered. Normalize, never assume.
+    """
+    out: set[str] = set()
+    for item in items or []:
+        if isinstance(item, str):
+            out.add(item)
+        elif isinstance(item, dict):
+            slug = item.get('slug')
+            if isinstance(slug, str):
+                out.add(slug)
+        else:
+            log.warning("host_unknown_slug_shape", shape=type(item).__name__)
+    return out
+
+
 class HostConnection:
     """ONE WebSocket to the relay /ws/host/:account carrying MANY of our owned bots.
 
@@ -798,9 +821,53 @@ class HostConnection:
             except Exception as e:
                 log.debug("host_ping_failed", error=str(e))
 
+    async def _handle_frame(self, data: dict, ws) -> None:
+        """Dispatch one inbound control/chat frame.
+
+        Lives in its own method so the read loop can wrap the whole dispatch in a
+        single guard: any failure here drops one frame instead of the socket.
+        """
+        mtype = data.get('type', '')
+        if mtype == 'chat_request':
+            slug = (data.get('to') or {}).get('slug')
+            if not slug:
+                log.warning("host_msg_no_slug")
+                return
+            task = asyncio.create_task(handle_message(data, ws, slug))
+            task.add_done_callback(_log_task_exception)
+        elif mtype == 'attached':
+            # Normalize BOTH — `denied` arrives as {slug, reason} objects while `ok` is
+            # bare strings, and mixing shapes into a set is what took the socket down.
+            ok = _slugset(data.get('ok'))
+            denied = _slugset(data.get('denied'))
+            # ACT on the reply, don't just log it. A denied slug must leave `confirmed`
+            # so /status stops claiming it's reachable, and must stay in `attached` so
+            # the keepalive keeps retrying it.
+            self.confirmed.update(ok)
+            self.confirmed.difference_update(denied)
+            if denied:
+                log.warning("host_attach_denied", denied=sorted(denied),
+                            note="relay refused these slugs; keepalive will retry")
+            log.info("host_attached", ok=sorted(ok), denied=sorted(denied),
+                     confirmed=sorted(self.confirmed))
+        elif mtype == 'error':
+            # An error naming a slug means we can no longer trust its routing.
+            slug = data.get('slug')
+            if slug:
+                self.confirmed.discard(slug)
+            log.warning("host_error", code=data.get('code'), slug=slug)
+        elif mtype == 'pong':
+            self.last_pong = time.time()
+        elif mtype == 'slugs':
+            # Routing truth from the relay — reconcile against our intent.
+            self.last_pong = time.time()
+            await self._reconcile(data.get('attached') or [])
+        elif 'error' in data:
+            log.warning("host_relay_error", error=data.get('error'))
+
     async def _reconcile(self, relay_slugs: list) -> None:
         """Relay's view is authoritative. Re-attach anything we want that it isn't serving."""
-        relay = set(relay_slugs or [])
+        relay = _slugset(relay_slugs)
         self.confirmed = self.attached & relay
         missing = self.attached - relay
         if missing:
@@ -845,41 +912,17 @@ class HostConnection:
                         except json.JSONDecodeError:
                             log.warning("host_invalid_json", raw=raw[:200])
                             continue
-                        mtype = data.get('type', '')
-                        if mtype == 'chat_request':
-                            slug = (data.get('to') or {}).get('slug')
-                            if not slug:
-                                log.warning("host_msg_no_slug")
-                                continue
-                            task = asyncio.create_task(handle_message(data, ws, slug))
-                            task.add_done_callback(_log_task_exception)
-                        elif mtype == 'attached':
-                            ok = data.get('ok') or []
-                            denied = data.get('denied') or []
-                            # ACT on the reply, don't just log it. A denied slug must leave
-                            # `confirmed` so /status stops claiming it's reachable, and must
-                            # stay in `attached` so the keepalive keeps retrying it.
-                            self.confirmed.update(ok)
-                            self.confirmed.difference_update(denied)
-                            if denied:
-                                log.warning("host_attach_denied", denied=denied,
-                                            note="relay refused these slugs; keepalive will retry")
-                            log.info("host_attached", ok=ok, denied=denied,
-                                     confirmed=sorted(self.confirmed))
-                        elif mtype == 'error':
-                            # An error naming a slug means we can no longer trust its routing.
-                            slug = data.get('slug')
-                            if slug:
-                                self.confirmed.discard(slug)
-                            log.warning("host_error", code=data.get('code'), slug=slug)
-                        elif mtype == 'pong':
-                            self.last_pong = time.time()
-                        elif mtype == 'slugs':
-                            # Routing truth from the relay — reconcile against our intent.
-                            self.last_pong = time.time()
-                            await self._reconcile(data.get('attached') or [])
-                        elif 'error' in data:
-                            log.warning("host_relay_error", error=data.get('error'))
+                        # One malformed or unexpected frame must never take the socket
+                        # down. An unhandled TypeError in the dispatch previously killed
+                        # this loop and put every bot on the account into a permanent
+                        # reconnect cycle — connected, attached, delivering nothing.
+                        # Contain per-frame failures and keep serving.
+                        try:
+                            await self._handle_frame(data, ws)
+                        except Exception as e:
+                            log.error("host_frame_error", mtype=data.get('type', ''),
+                                      error=str(e), exc_info=True,
+                                      note="frame dropped; socket kept open")
             except asyncio.CancelledError:
                 break
             except websockets.ConnectionClosed as e:
