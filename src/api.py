@@ -688,13 +688,58 @@ async def _send_audio_frame(ws, original_envelope: dict, bot_slug: str, audio_b6
         log.warning("audio_frame_error", error=str(e), bot=bot_slug)
 
 
-async def send_response(ws, original_envelope: dict, bot_slug: str, text: str, spoken: str = '', attachments: list[dict] = None, audio_base64: str = '') -> None:
-    """Wrap text in an envelope and send it back through the relay WebSocket."""
+def _live_host_ws():
+    """The CURRENT host socket, or None. Resolved at call time, never cached."""
     try:
-        response_envelope = build_response_envelope(original_envelope, bot_slug, text, spoken, attachments=attachments, audio_base64=audio_base64)
-        await ws.send(json.dumps(response_envelope))
-    except websockets.ConnectionClosed:
-        log.warning("send_on_closed_ws", bot=bot_slug)
+        host = getattr(connection_manager, "_host", None)
+        return getattr(host, "ws", None) if host else None
+    except Exception:
+        return None
+
+
+async def send_response(ws, original_envelope: dict, bot_slug: str, text: str, spoken: str = '', attachments: list[dict] = None, audio_base64: str = '') -> None:
+    """Wrap text in an envelope and send it back through the relay WebSocket.
+
+    Sends on the LIVE socket, not the one the message arrived on.
+
+    A turn takes seconds; the host connection can reconnect in that window. The socket
+    captured at receive time is then dead, the reply was written to it, and the failure
+    surfaced only as a 'send_on_closed_ws' warning — so the bot had answered, the
+    gatekeeper had recorded the answer, and the user saw nothing. Observed exactly that:
+    message in at :36, answered at :42, dropped at :45.
+
+    So: try the captured socket, then the current one, and wait out a reconnect in
+    progress rather than discarding a completed turn. Losing an answer is far more
+    expensive than a few seconds of retry.
+    """
+    response_envelope = build_response_envelope(
+        original_envelope, bot_slug, text, spoken,
+        attachments=attachments, audio_base64=audio_base64,
+    )
+    payload = json.dumps(response_envelope)
+
+    deadline = time.time() + 15
+    tried_captured = False
+    while True:
+        sock = ws if not tried_captured else _live_host_ws()
+        tried_captured = True
+        if sock is not None:
+            try:
+                await sock.send(payload)
+                log.info("response_sent", bot=bot_slug, length=len(text),
+                         on_captured_socket=(sock is ws))
+                return
+            except websockets.ConnectionClosed:
+                pass
+            except Exception as e:
+                log.warning("response_send_error", bot=bot_slug, error=str(e))
+        if time.time() >= deadline:
+            break
+        await asyncio.sleep(1)
+
+    # Never lose an answer in silence.
+    log.error("response_dropped", bot=bot_slug, length=len(text),
+              note="no live host socket after retry; the turn completed but the user got nothing")
 
 
 # =============================================================================
