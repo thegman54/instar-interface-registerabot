@@ -440,6 +440,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     messages, source_info = extract_messages_from_envelope(envelope)
     user_context = extract_user_context_from_envelope(envelope)
     assertion = extract_assertion_from_envelope(envelope)
+    # Diagnostic: which top-level fields actually arrived, and did the assertion survive
+    # the portal -> relay -> here hop. Logs shape only, never the token itself.
+    log.info("envelope_fields", keys=sorted(envelope.keys()),
+             has_assertion=bool(assertion), assertion_len=len(assertion or ""))
 
     if not messages:
         log.warning("empty_message", session=session_id, source=source_info, bot=bot_slug)
