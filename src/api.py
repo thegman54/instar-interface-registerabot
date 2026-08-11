@@ -846,7 +846,11 @@ class HostConnection:
             self.confirmed.update(ok)
             self.confirmed.difference_update(denied)
             if denied:
+                # Log the relay's own reason verbatim, not just the slug names. A denial
+                # is the difference between "attached" and "silently black-holing every
+                # message for this bot", so WHY it was refused is the whole diagnostic.
                 log.warning("host_attach_denied", denied=sorted(denied),
+                            raw=data.get('denied'),
                             note="relay refused these slugs; keepalive will retry")
             log.info("host_attached", ok=sorted(ok), denied=sorted(denied),
                      confirmed=sorted(self.confirmed))
