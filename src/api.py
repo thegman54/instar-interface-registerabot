@@ -71,6 +71,15 @@ HOST_MODE = bool(RELAY_URL and ACCOUNT_ID and ACCOUNT_KEY)
 # socket is open; this proves the RELAY is still answering us. Stale pong => routing suspect.
 HOST_PING_SECONDS = int(os.environ.get('REGISTERABOT_HOST_PING_SECONDS', '30'))
 
+# SPOKEN TOOL NARRATION — the bot says what it is doing WHILE it does it.
+# Status frames already carry the bot's own stated intent (the `why` it passes to every tool
+# call), so the text is genuinely descriptive rather than a generic "working…". This voices
+# it. OFF by default: one TTS call per distinct step, and a busy turn has ten — great for a
+# demo, expensive as a default. Silent unless the profile has a voice group.
+NARRATE_TOOLS = os.environ.get('REGISTERABOT_NARRATE_TOOLS', '').lower() in ('1', 'true', 'yes')
+# Skip trivially short phrases — narrating "thinking" is noise, not information.
+NARRATE_MIN_CHARS = int(os.environ.get('REGISTERABOT_NARRATE_MIN_CHARS', '12'))
+
 # Upper bound the connector waits for a bot turn. The REAL budget is per-profile and
 # enforced by the gatekeeper (which returns within it); this ceiling just has to exceed
 # the largest profile timeout so httpx never throws ReadTimeout before the gatekeeper replies.
@@ -221,6 +230,59 @@ def build_status_envelope(original_envelope: dict, bot_slug: str, text: str) -> 
         'encrypted': False,
         'payload': json.dumps({'status': text}),
     }
+
+
+def build_status_audio_envelope(original_envelope: dict, bot_slug: str,
+                                text: str, audio_base64: str) -> dict:
+    """Spoken narration for ONE status step.
+
+    Deliberately its own frame type rather than audio bolted onto the status frame: the text
+    must reach the UI immediately (so the progress line updates the moment the tool fires),
+    while the audio arrives whenever TTS finishes, a second or two later. One frame carrying
+    both would make the visible line wait on speech synthesis.
+
+    Clients that don't know this type ignore it — but note any client whose terminal branch
+    matches "has a payload" MUST skip it explicitly, or it will end the turn the way the
+    decoupled audio_response frame used to.
+    """
+    return {
+        'v': 1,
+        'type': 'status_audio',
+        'session_id': original_envelope.get('session_id', ''),
+        'timestamp': int(time.time() * 1000),
+        'from': {'kind': 'bot', 'slug': bot_slug},
+        'to': original_envelope.get('from', {}),
+        'encrypted': False,
+        'payload': json.dumps({
+            'status': text,
+            'format': 'mp3',
+            'mime_type': 'audio/mpeg',
+            'base64': audio_base64,
+        }),
+    }
+
+
+# slug -> voice_group_id ('' = none). Resolved once per slug; the profile's voice does not
+# change mid-conversation, and this is on the hot path of every turn.
+_voice_group_cache: dict[str, str] = {}
+
+
+async def _get_voice_group(bot_slug: str) -> str:
+    """The profile's effective voice group, for narrating tool calls as they happen.
+    The /process response also carries this, but only AFTER the turn — too late to narrate."""
+    if bot_slug in _voice_group_cache:
+        return _voice_group_cache[bot_slug]
+    admin = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
+    vg = ''
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{admin}/api/profiles/{bot_slug}/voice", timeout=8.0)
+            if r.status_code == 200:
+                vg = str(r.json().get('voice_group_id') or '')
+    except Exception as e:
+        log.debug("voice_group_lookup_failed", slug=bot_slug, error=str(e))
+    _voice_group_cache[bot_slug] = vg
+    return vg
 
 
 def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: str) -> dict:
@@ -391,6 +453,24 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
     # narration (a second snapshot query, the plan dry-run, etc.), but we don't spam
     # the same phrase twice in a row.
     last_phrase: str | None = None
+    # Narration state. TTS runs OFF the read loop so a slow synth never delays the next
+    # status line, but clips are serialised behind one lock so they arrive — and therefore
+    # play — in the order the steps actually happened.
+    voice_group = await _get_voice_group(bot_slug) if NARRATE_TOOLS else ''
+    narrate_lock = asyncio.Lock()
+    narrate_tasks: list[asyncio.Task] = []
+
+    async def _narrate(phrase: str) -> None:
+        async with narrate_lock:
+            audio = await _generate_tts(phrase, voice_group)
+            if not audio:
+                return
+            try:
+                await relay_ws.send(json.dumps(
+                    build_status_audio_envelope(envelope, bot_slug, phrase, audio)))
+            except Exception:
+                pass
+
     try:
         async with websockets.connect(ws_url, open_timeout=5) as tws:
             async for raw in tws:
@@ -414,7 +494,18 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                         await relay_ws.send(json.dumps(build_status_envelope(envelope, bot_slug, phrase)))
                     except Exception:
                         return
+                    # Voice it behind the text, never in front of it.
+                    if voice_group and len(phrase) >= NARRATE_MIN_CHARS:
+                        t = asyncio.create_task(_narrate(phrase))
+                        t.add_done_callback(_log_task_exception)
+                        narrate_tasks.append(t)
     except asyncio.CancelledError:
+        # The caller cancels us once the final response is in hand. Drop any narration still
+        # queued — speech for a step the operator has already seen the answer to is just
+        # confusing, and it would talk over the final reply's own audio.
+        for t in narrate_tasks:
+            if not t.done():
+                t.cancel()
         raise
     except Exception as e:
         log.debug("status_stream_ended", error=str(e), bot=bot_slug)
