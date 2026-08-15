@@ -315,7 +315,11 @@ def build_idle_envelope(original_envelope: dict, bot_slug: str, video_base64: st
     }
 
 
-_idle_b64_cache: dict = {}  # avatar_id -> base64 idle mp4 (fetched once from the face-renderer)
+# avatar_id -> (base64 idle mp4, fetched_at). TTL'd, NOT permanent: the idle is retuned
+# and rebaked from the admin UI, and a process-lifetime cache meant a running container
+# served the first clip it ever saw until someone restarted it.
+_idle_b64_cache: dict = {}
+IDLE_CACHE_TTL = float(os.environ.get('IDLE_CACHE_TTL', '60'))
 
 
 async def _send_idle_frame(ws, envelope: dict, bot_slug: str, avatar_id: str) -> None:
@@ -324,17 +328,25 @@ async def _send_idle_frame(ws, envelope: dict, bot_slug: str, avatar_id: str) ->
     import base64
     face_url = os.environ.get('FACE_RENDERER_URL', 'http://instar-face-renderer:8088')
     try:
-        b64 = _idle_b64_cache.get(avatar_id)
+        cached = _idle_b64_cache.get(avatar_id)
+        b64 = cached[0] if cached and (time.time() - cached[1]) < IDLE_CACHE_TTL else None
         if not b64:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 r = await client.get(f"{face_url}/avatars/{avatar_id}/idle")
             if r.status_code != 200:
-                return
-            b64 = base64.b64encode(r.content).decode()
-            _idle_b64_cache[avatar_id] = b64
+                # Was a silent return — a missing idle then looked identical to a working
+                # one, and the browser just showed nothing.
+                log.warning("idle_fetch_failed", status=r.status_code, avatar=avatar_id, bot=bot_slug)
+                if cached:
+                    b64 = cached[0]  # serve the stale copy rather than nothing
+                else:
+                    return
+            else:
+                b64 = base64.b64encode(r.content).decode()
+                _idle_b64_cache[avatar_id] = (b64, time.time())
         await ws.send(json.dumps(build_idle_envelope(envelope, bot_slug, b64)))
     except Exception as e:
-        log.debug("idle_frame_error", error=str(e), bot=bot_slug)
+        log.warning("idle_frame_error", error=str(e), bot=bot_slug)
 
 
 async def _get_face_config(voice_group_id: str) -> dict:
