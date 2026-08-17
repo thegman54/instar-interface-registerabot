@@ -24,9 +24,11 @@ services:
       # Speak each tool step aloud as it happens — one TTS call per step, so default OFF.
       - REGISTERABOT_NARRATE_TOOLS=${REGISTERABOT_NARRATE_TOOLS:-0}
       # Stream the talking head as several clips instead of one, so the first lands in ~7s
-      # rather than ~20s. Requires the browser <VideoAvatar> to QUEUE video frames by seq —
-      # if it swaps its source per frame, only the last clip plays. Default OFF.
-      - FACE_CHUNKED=${FACE_CHUNKED:-0}
+      # rather than ~20s. Requires the consuming client to QUEUE video frames by seq: the
+      # portal chat does (platform modules/portal .../use-chat.ts) and Slack numbers them.
+      # To disable, set FACE_CHUNKED=0 on the TOOL-EXECUTOR service — stack_manager passes
+      # its own os.environ through to compose, so that's where the override has to live.
+      - FACE_CHUNKED=${FACE_CHUNKED:-1}
       - PORT=8091
     ports:
       - "8091:8091"
