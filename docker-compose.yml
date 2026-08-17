@@ -23,12 +23,16 @@ services:
       - BOT_SERVICE_URL=${BOT_SERVICE_URL:-http://bot:8080}
       # Speak each tool step aloud as it happens — one TTS call per step, so default OFF.
       - REGISTERABOT_NARRATE_TOOLS=${REGISTERABOT_NARRATE_TOOLS:-0}
-      # Stream the talking head as several clips instead of one, so the first lands in ~7s
-      # rather than ~20s. Requires the consuming client to QUEUE video frames by seq: the
-      # portal chat does (platform modules/portal .../use-chat.ts) and Slack numbers them.
-      # To disable, set FACE_CHUNKED=0 on the TOOL-EXECUTOR service — stack_manager passes
-      # its own os.environ through to compose, so that's where the override has to live.
-      - FACE_CHUNKED=${FACE_CHUNKED:-1}
+      # Stream the talking head as several clips instead of one. OFF — tried 2026-08-17 and
+      # backed out: the joins are audible. Each chunk is an independently encoded AAC track,
+      # and AAC carries encoder delay + padding at every boundary, so playing clips back to
+      # back inserts real gaps and clicks. That is a property of concatenating separate MP4s,
+      # not of where the cut lands — no smarter cut point fixes it. Seamless streaming needs
+      # ONE continuous audio track: fMP4 segments through MediaSource Extensions, the
+      # 'mp4-segment' format already sketched in docs/STREAMING_CHAT_BROKER.md. Until then a
+      # single clip is the only thing that sounds right, so make the whole render faster
+      # rather than cutting it up. Override via the TOOL-EXECUTOR service's env.
+      - FACE_CHUNKED=${FACE_CHUNKED:-0}
       - PORT=8091
     ports:
       - "8091:8091"
