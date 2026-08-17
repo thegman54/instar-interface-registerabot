@@ -310,6 +310,48 @@ def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: s
     }
 
 
+_MEDIA_STATUS_TEXT = {
+    'audio': 'finding her voice',
+    'video': 'rendering her face',
+}
+
+
+def build_media_status_envelope(original_envelope: dict, bot_slug: str,
+                                stage: str, state: str) -> dict:
+    """Progress for the media that arrives AFTER the text — TTS, then the avatar render.
+
+    The existing 'status' frame can't carry this: it narrates tool use during the turn and
+    the portal only shows it while the turn is in flight, but media is produced after the
+    final response, when that indicator is already gone. So it gets its own type, and the
+    client shows it on the avatar rather than in the turn's status line.
+
+    Optional/additive — a client that doesn't understand 'media_status' ignores it, which
+    is exactly the behaviour before this existed.
+    """
+    return {
+        'v': 1,
+        'type': 'media_status',
+        'session_id': original_envelope.get('session_id', ''),
+        'timestamp': int(time.time() * 1000),
+        'from': {'kind': 'bot', 'slug': bot_slug},
+        'to': original_envelope.get('from', {}),
+        'encrypted': False,
+        'payload': json.dumps({
+            'stage': stage,                 # 'audio' | 'video'
+            'state': state,                 # 'start' | 'done'
+            'text': _MEDIA_STATUS_TEXT.get(stage, stage),
+        }),
+    }
+
+
+async def _send_media_status(ws, envelope: dict, bot_slug: str, stage: str, state: str) -> None:
+    """Fire-and-forget progress ping. Never let telling someone we're working break the work."""
+    try:
+        await ws.send(json.dumps(build_media_status_envelope(envelope, bot_slug, stage, state)))
+    except Exception as e:
+        log.debug("media_status_send_failed", error=str(e), stage=stage, state=state, bot=bot_slug)
+
+
 def build_idle_envelope(original_envelope: dict, bot_slug: str, video_base64: str) -> dict:
     """A looping mouth-closed idle clip for the avatar circle (browser loops it between
     turns so she's always present). Optional/additive; clients ignore unknown types."""
@@ -388,6 +430,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
     face_url = os.environ.get('FACE_RENDERER_URL', 'http://instar-face-renderer:8088')
     turn_id = f"{envelope.get('session_id', '')}:{int(time.time() * 1000)}"
     wav = base64.b64decode(audio_b64)
+    await _send_media_status(ws, envelope, bot_slug, 'video', 'start')
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
             if not FACE_CHUNKED:
@@ -438,6 +481,10 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                 log.debug("video_render_empty", bot=bot_slug)
     except Exception as e:
         log.debug("video_render_error", error=str(e), bot=bot_slug)
+    finally:
+        # Clear on every exit path, including failure — a stuck "rendering her face" reads
+        # as a hang, which is worse than never having shown it.
+        await _send_media_status(ws, envelope, bot_slug, 'video', 'done')
 
 
 # Friendly progress wording per tool (tweak freely). Falls back to a cleaned name.
@@ -713,22 +760,32 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                 # Option A: generate TTS inline and embed it in the response envelope so
                 # audio reaches synchronous /ask clients (the platform assistant). Also emit
                 # the legacy separate frame below for persistent WS clients (the website).
+                #
+                # With the avatar ON the audio is NOT embedded (the video carries it), so
+                # nothing in the text response depends on TTS — synthesising first just made
+                # the reader wait for it. Measured 5.7s of dead time in front of the text on
+                # 2026-08-17. Avatar on: send text, then synthesise. Avatar off: the envelope
+                # genuinely needs the audio, so the original order stands.
                 audio_b64 = ''
-                if spoken and voice_group_id:
-                    audio_b64 = await _generate_tts(spoken, voice_group_id)
-
-                # Suppress standalone audio when the avatar is on (the video is the audio).
-                embed_audio = audio_b64 if (audio_b64 and not face_on) else ''
-
-                await send_response(
-                    ws, envelope, bot_slug, gk_data['response'],
-                    spoken,
-                    attachments=text_attachments or None,
-                    audio_base64=embed_audio,
-                )
-
-                if embed_audio:
-                    await _send_audio_frame(ws, envelope, bot_slug, embed_audio)
+                if face_on:
+                    await send_response(
+                        ws, envelope, bot_slug, gk_data['response'], spoken,
+                        attachments=text_attachments or None, audio_base64='',
+                    )
+                    if spoken and voice_group_id:
+                        await _send_media_status(ws, envelope, bot_slug, 'audio', 'start')
+                        audio_b64 = await _generate_tts(spoken, voice_group_id)
+                        await _send_media_status(ws, envelope, bot_slug, 'audio', 'done')
+                else:
+                    if spoken and voice_group_id:
+                        audio_b64 = await _generate_tts(spoken, voice_group_id)
+                    embed_audio = audio_b64
+                    await send_response(
+                        ws, envelope, bot_slug, gk_data['response'], spoken,
+                        attachments=text_attachments or None, audio_base64=embed_audio,
+                    )
+                    if embed_audio:
+                        await _send_audio_frame(ws, envelope, bot_slug, embed_audio)
 
                 # Talking-head avatar (face_enabled). Send the idle loop first (browser
                 # loops it while she "thinks"), then the talking clip when it renders — both
