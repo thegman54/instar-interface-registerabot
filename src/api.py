@@ -285,18 +285,28 @@ async def _get_voice_group(bot_slug: str) -> str:
     return vg
 
 
-def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: str) -> dict:
+def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: str,
+                         turn_id: str = '', seq: int = 0, final: bool = True) -> dict:
     """A talking-head video frame (MP4) routed back to the sender. Optional/additive —
-    clients without a <VideoAvatar> ignore it. Arrives well after text (render latency)."""
+    clients without a <VideoAvatar> ignore it. Arrives well after text (render latency).
+
+    turn_id/seq/final carry the ordering a chunked turn needs (see the frame contract in
+    project-instar docs/STREAMING_CHAT_BROKER.md). Unchunked turns send a single seq=0,
+    final=true frame, which is what every client saw before chunking existed — a client
+    that ignores these fields behaves exactly as it did.
+    """
     return {
         'v': 1,
         'type': 'video',
         'session_id': original_envelope.get('session_id', ''),
         'timestamp': int(time.time() * 1000),
+        'turn_id': turn_id,
+        'seq': seq,
         'from': {'kind': 'bot', 'slug': bot_slug},
         'to': original_envelope.get('from', {}),
         'encrypted': False,
-        'payload': json.dumps({'format': 'mp4', 'base64': video_base64}),
+        'payload': json.dumps({'format': 'mp4', 'base64': video_base64,
+                               'turn_id': turn_id, 'seq': seq, 'final': final}),
     }
 
 
@@ -362,24 +372,70 @@ async def _get_face_config(voice_group_id: str) -> dict:
     return {}
 
 
+# Chunked rendering is OFF by default. It only helps if the browser's <VideoAvatar>
+# QUEUES incoming video frames and plays them back to back — if it instead swaps its
+# source on each frame, a chunked turn plays only the last clip. That component lives in
+# the hosted page, not this repo, so the safe default is the single-clip behaviour that
+# has always worked. Flip FACE_CHUNKED=true once the client is known to queue by seq.
+FACE_CHUNKED = os.environ.get('FACE_CHUNKED', '').lower() in ('1', 'true', 'yes')
+
+
 async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: str, avatar_id: str) -> None:
-    """Decoupled talking-head avatar: render the turn's audio through the avatar (~3-4s at
-    FPS=12) and send a 'video' frame carrying the lip-synced clip (with audio baked in).
+    """Decoupled talking-head avatar: render the turn's audio through the avatar and send
+    'video' frame(s) carrying the lip-synced clip (with audio baked in).
     Fire-and-forget; any failure is swallowed so it never affects the chat."""
     import base64
     face_url = os.environ.get('FACE_RENDERER_URL', 'http://instar-face-renderer:8088')
+    turn_id = f"{envelope.get('session_id', '')}:{int(time.time() * 1000)}"
+    wav = base64.b64decode(audio_b64)
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
-            resp = await client.post(
-                f"{face_url}/render",
-                files={'audio': ('speech.wav', base64.b64decode(audio_b64), 'audio/mpeg')},
-                data={'avatar_id': avatar_id},
-            )
-            if resp.status_code != 200:
-                log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+            if not FACE_CHUNKED:
+                resp = await client.post(
+                    f"{face_url}/render",
+                    files={'audio': ('speech.wav', wav, 'audio/mpeg')},
+                    data={'avatar_id': avatar_id},
+                )
+                if resp.status_code != 200:
+                    log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+                    return
+                await ws.send(json.dumps(build_video_envelope(
+                    envelope, bot_slug, base64.b64encode(resp.content).decode(),
+                    turn_id=turn_id, seq=0, final=True)))
+                log.info("video_frame_sent", bytes=len(resp.content), bot=bot_slug)
                 return
-            await ws.send(json.dumps(build_video_envelope(envelope, bot_slug, base64.b64encode(resp.content).decode())))
-            log.info("video_frame_sent", bytes=len(resp.content), bot=bot_slug)
+
+            # Chunked: forward each clip the moment it lands rather than waiting for the
+            # whole turn. The renderer streams NDJSON, one object per clip.
+            sent = 0
+            async with client.stream(
+                'POST', f"{face_url}/render/chunked",
+                files={'audio': ('speech.wav', wav, 'audio/mpeg')},
+                data={'avatar_id': avatar_id},
+            ) as resp:
+                if resp.status_code != 200:
+                    log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+                    return
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except Exception:
+                        continue
+                    if chunk.get('error') or not chunk.get('base64'):
+                        log.debug("video_chunk_error", error=chunk.get('error'), bot=bot_slug)
+                        continue
+                    await ws.send(json.dumps(build_video_envelope(
+                        envelope, bot_slug, chunk['base64'],
+                        turn_id=turn_id, seq=chunk.get('seq', sent),
+                        final=bool(chunk.get('final')))))
+                    sent += 1
+                    log.info("video_frame_sent", bot=bot_slug, seq=chunk.get('seq'),
+                             final=bool(chunk.get('final')), frames=chunk.get('frames'),
+                             render_secs=chunk.get('elapsed'))
+            if not sent:
+                log.debug("video_render_empty", bot=bot_slug)
     except Exception as e:
         log.debug("video_render_error", error=str(e), bot=bot_slug)
 

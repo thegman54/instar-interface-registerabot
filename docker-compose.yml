@@ -21,6 +21,12 @@ services:
       - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL:-wss://relay.registerabot.com}
       - GATEKEEPER_URL=${GATEKEEPER_URL:-http://gatekeeper:8080}
       - BOT_SERVICE_URL=${BOT_SERVICE_URL:-http://bot:8080}
+      # Speak each tool step aloud as it happens — one TTS call per step, so default OFF.
+      - REGISTERABOT_NARRATE_TOOLS=${REGISTERABOT_NARRATE_TOOLS:-0}
+      # Stream the talking head as several clips instead of one, so the first lands in ~7s
+      # rather than ~20s. Requires the browser <VideoAvatar> to QUEUE video frames by seq —
+      # if it swaps its source per frame, only the last clip plays. Default OFF.
+      - FACE_CHUNKED=${FACE_CHUNKED:-0}
       - PORT=8091
     ports:
       - "8091:8091"
