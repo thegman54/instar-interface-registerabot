@@ -1217,6 +1217,17 @@ class HostConnection:
                 return
             task = asyncio.create_task(handle_message(data, ws, slug))
             task.add_done_callback(_log_task_exception)
+        elif mtype in ('stt_partial', 'stt_final', 'stt_release'):
+            # Speech as it arrives, on the HOST connection — which is the path every
+            # bot actually uses. There are two dispatch sites in this file and only
+            # this one is live; wiring the other is a change that deploys cleanly,
+            # logs nothing and does nothing.
+            stt_slug = (data.get('to') or {}).get('slug') or slug
+            if not stt_slug:
+                log.warning("host_stt_no_slug")
+                return
+            task = asyncio.create_task(handle_stt_frame(data, ws, stt_slug))
+            task.add_done_callback(_log_task_exception)
         elif mtype == 'attached':
             # Normalize BOTH — `denied` arrives as {slug, reason} objects while `ok` is
             # bare strings, and mixing shapes into a set is what took the socket down.
