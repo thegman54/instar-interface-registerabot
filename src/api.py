@@ -25,9 +25,11 @@ import httpx
 import websockets
 import structlog
 
-from turntaking.config import ConfigCache as TurnConfigCache
-from turntaking.detector import TurnDetector
-from turntaking.session import SessionRegistry as TurnSessionRegistry, TurnSession
+# Relative: this runs as `python -m src.api` from /app, so `src` is the package and a
+# bare `from turntaking...` resolves against /app, not against this file's directory.
+from .turntaking.config import ConfigCache as TurnConfigCache
+from .turntaking.detector import TurnDetector
+from .turntaking.session import SessionRegistry as TurnSessionRegistry, TurnSession
 
 
 # =============================================================================
