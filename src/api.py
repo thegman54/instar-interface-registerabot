@@ -25,6 +25,10 @@ import httpx
 import websockets
 import structlog
 
+from turntaking.config import ConfigCache as TurnConfigCache
+from turntaking.detector import TurnDetector
+from turntaking.session import SessionRegistry as TurnSessionRegistry, TurnSession
+
 
 # =============================================================================
 # LOGGING
@@ -53,6 +57,7 @@ log = structlog.get_logger()
 # =============================================================================
 
 GATEKEEPER_URL = os.environ.get('GATEKEEPER_URL', 'http://gatekeeper:8080')
+LLM_URL = os.environ.get('LLM_URL', 'http://llm:11434')
 BOT_SERVICE_URL = os.environ.get('BOT_SERVICE_URL', 'http://bot:8080')
 
 RELAY_URL = os.environ.get('REGISTERABOT_RELAY_URL', '')
@@ -629,6 +634,88 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
 # =============================================================================
 # MESSAGE HANDLER
 # =============================================================================
+
+# ─── Turn taking ──────────────────────────────────────────────────────────────────
+#
+# The browser streams what it is hearing as it hears it, instead of sending one block
+# of text when the button comes up. Something then has to decide when a person has
+# finished a thought, or the bot gets handed a turn per syllable.
+#
+# That decision lives in src/turntaking/ and is pure and tested. This is only the glue:
+# it owns the clock, the sockets and the envelopes, and hands everything else over.
+#
+# See docs/VOICE_TURN_PIPELINE.md in project-instar.
+
+_turn_config = TurnConfigCache(GATEKEEPER_URL)
+_turn_detector = TurnDetector(LLM_URL)
+_turn_sessions = TurnSessionRegistry()
+
+
+def build_turn_state_envelope(original: dict, bot_slug: str,
+                              state: str, text: str) -> dict:
+    """Tell the page what is held and what has been committed.
+
+    This is the visible half of the whole feature. Without it the buffering is
+    invisible: a person speaks, nothing appears, and they cannot tell whether they
+    are being heard or ignored. 'buffering' is provisional and should be shown
+    greyed; 'flushed' is the moment it became a turn.
+    """
+    return {
+        'v': 1,
+        'type': 'turn_state',
+        'session_id': original.get('session_id', ''),
+        'timestamp': int(time.time() * 1000),
+        'from': {'kind': 'bot', 'slug': bot_slug},
+        'to': original.get('from', {}),
+        'encrypted': False,
+        'payload': json.dumps({'state': state, 'text': text}),
+    }
+
+
+async def handle_stt_frame(envelope: dict, ws, bot_slug: str) -> None:
+    """A partial, a final, or a release from the browser's recogniser."""
+    session_id = envelope.get('session_id', '')
+    if not session_id:
+        return
+    kind = envelope.get('type', '')
+    text = ''
+    try:
+        payload = envelope.get('payload')
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        text = ((payload or {}).get('text') or '') if isinstance(payload, dict) else ''
+    except Exception:
+        text = ''
+
+    async def on_flush(flushed_text: str, reason: str) -> None:
+        # A flush IS a turn. Rebuild the envelope the rest of this file already knows
+        # how to handle rather than inventing a second path into the gatekeeper —
+        # history, hints, identity and timeouts all live on that one road.
+        turn = dict(envelope)
+        turn['type'] = 'chat_request'
+        turn['messages'] = [{'role': 'user', 'content': flushed_text}]
+        turn.pop('payload', None)
+        await handle_message(turn, ws, bot_slug)
+
+    async def on_state(state: str, state_text: str) -> None:
+        try:
+            await ws.send(json.dumps(
+                build_turn_state_envelope(envelope, bot_slug, state, state_text)))
+        except Exception as e:
+            log.debug("turn_state_send_failed", error=str(e))
+
+    session = _turn_sessions.get(session_id, lambda: TurnSession(
+        session_id, on_flush, on_state, detector=_turn_detector))
+    session.start(_turn_config.get)
+
+    cfg = await _turn_config.get()
+    if kind == 'stt_partial':
+        await session.partial(text, cfg)
+    elif kind == 'stt_final':
+        await session.final(text, cfg)
+    elif kind == 'stt_release':
+        await session.release(cfg)
+
 
 async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     """
@@ -1374,6 +1461,12 @@ class ConnectionManager:
                         msg_type = data.get('type', '')
                         if msg_type == 'chat_request':
                             task = asyncio.create_task(handle_message(data, ws, conn.slug))
+                            task.add_done_callback(_log_task_exception)
+                        elif msg_type in ('stt_partial', 'stt_final', 'stt_release'):
+                            # Speech as it arrives. These are NOT turns — the
+                            # turn-taking session decides if and when they become one.
+                            task = asyncio.create_task(
+                                handle_stt_frame(data, ws, conn.slug))
                             task.add_done_callback(_log_task_exception)
                         elif 'error' in data:
                             log.warning("relay_error", error=data.get('error'), slug=conn.slug)
