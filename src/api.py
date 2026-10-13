@@ -654,7 +654,8 @@ _turn_sessions = TurnSessionRegistry()
 
 
 def build_turn_state_envelope(original: dict, bot_slug: str,
-                              state: str, text: str) -> dict:
+                              state: str, text: str,
+                              max_silence_ms: int = 0) -> dict:
     """Tell the page what is held and what has been committed.
 
     This is the visible half of the whole feature. Without it the buffering is
@@ -670,7 +671,12 @@ def build_turn_state_envelope(original: dict, bot_slug: str,
         'from': {'kind': 'bot', 'slug': bot_slug},
         'to': original.get('from', {}),
         'encrypted': False,
-        'payload': json.dumps({'state': state, 'text': text}),
+        # The page draws a sweep for the pause that is about to end the turn. Send the
+        # threshold rather than letting the browser assume one: a sweep that finishes
+        # at a different moment than the flush is worse than no sweep, because it
+        # teaches the visitor a timing that is not real.
+        'payload': json.dumps({'state': state, 'text': text,
+                               'max_silence_ms': max_silence_ms}),
     }
 
 
@@ -701,8 +707,9 @@ async def handle_stt_frame(envelope: dict, ws, bot_slug: str) -> None:
 
     async def on_state(state: str, state_text: str) -> None:
         try:
+            ms = int((await _turn_config.get()).thresholds.max_silence * 1000)
             await ws.send(json.dumps(
-                build_turn_state_envelope(envelope, bot_slug, state, state_text)))
+                build_turn_state_envelope(envelope, bot_slug, state, state_text, ms)))
         except Exception as e:
             log.debug("turn_state_send_failed", error=str(e))
 
