@@ -34,6 +34,25 @@ PROMPT = (
 )
 
 
+# "Was that said to us, or did the microphone just overhear it?"
+#
+# A different question from completeness and a much more dangerous one to get wrong,
+# so the prompt is written to make KEEPING the easy answer: it is told to choose
+# RELEVANT when unsure, and the caller treats anything it cannot parse as RELEVANT too.
+RELEVANCE_PROMPT = (
+    "An assistant is listening through an open microphone and hears everything in "
+    "the room, including speech meant for other people.\n"
+    "Decide whether the LINE below was addressed to the assistant.\n"
+    "Reply with exactly one word: RELEVANT or ASIDE.\n\n"
+    "ASIDE means it was plainly not meant for the assistant: talking to someone else "
+    "in the room, a phone call, a television, background chatter.\n"
+    "RELEVANT means anything else, INCLUDING anything you are unsure about. When in "
+    "doubt answer RELEVANT.\n\n"
+    "{context}"
+    "Line: {text}\n\nAnswer:"
+)
+
+
 class TurnDetector:
     """Asks an Ollama model whether an utterance is finished."""
 
@@ -79,9 +98,49 @@ class TurnDetector:
             # the pause it is adjudicating, and a smaller model would be strictly better.
             log.info("turn_detect_slow", ms=ms, model=model,
                      note="a 0.5-1B model answers this in tens of ms")
-        if out.startswith("COMPLETE"):
-            return True
+        # INCOMPLETE first: "COMPLETE" is a prefix-match away from being found inside
+        # it, and a reversed verdict here sends fragments.
         if out.startswith("INCOMPLETE"):
             return False
+        if out.startswith("COMPLETE"):
+            return True
         log.debug("turn_detect_unparsed", got=out[:40])
+        return None
+
+    async def is_relevant(self, text: str, context: str, model: str) -> bool | None:
+        """Was this line addressed to us? True / False, or None for 'do not know'.
+
+        None is the ONLY safe default and the caller must treat it as 'keep'. Dropping
+        something a person actually said leaves them watching an assistant ignore
+        words that were on screen a second ago, with no way to tell why.
+        """
+        if not model or not text.strip():
+            return None
+        ctx = ""
+        if context:
+            # The last thing the assistant said, so "yes, do that" is recognisably a
+            # reply rather than a stray fragment. Bounded - this is a latency budget
+            # measured in tens of milliseconds, not a conversation.
+            ctx = "The assistant last said: " + context.strip()[-240:] + "\n"
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as c:
+                r = await c.post(f"{self._url}/api/generate", json={
+                    "model": model,
+                    "prompt": RELEVANCE_PROMPT.format(context=ctx,
+                                                      text=text.strip()[-TAIL_CHARS:]),
+                    "stream": False,
+                    "options": {"num_predict": 3, "temperature": 0.0},
+                })
+                r.raise_for_status()
+                out = ((r.json() or {}).get("response") or "").strip().upper()
+        except Exception as e:                                   # noqa: BLE001
+            log.debug("relevance_detect_failed", error=str(e),
+                      ms=int((time.monotonic() - t0) * 1000))
+            return None
+        if out.startswith("ASIDE"):
+            return False
+        if out.startswith("RELEVANT"):
+            return True
+        log.debug("relevance_unparsed", got=out[:40])
         return None

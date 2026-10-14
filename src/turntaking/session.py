@@ -24,6 +24,7 @@ from typing import Awaitable, Callable, Optional
 
 import structlog
 
+from .aside import AsideJudge, surviving
 from .buffer import TranscriptBuffer
 from .config import TurnConfig
 from .rules import decide
@@ -43,7 +44,7 @@ class TurnSession:
         self,
         session_id: str,
         on_flush: Callable[[str, str], Awaitable[None]],
-        on_state: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_state: Optional[Callable[..., Awaitable[None]]] = None,
         detector=None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -58,6 +59,11 @@ class TurnSession:
         self._task: Optional[asyncio.Task] = None
         self._model_answer: Optional[bool] = None
         self._asked_for: str = ""          # the text the model's answer applies to
+        self._judge = AsideJudge(detector)
+        self._judging: Optional[asyncio.Task] = None
+        # The last thing the assistant said. Context for "was that meant for us" -
+        # without it, "yes do that" is indistinguishable from a stray fragment.
+        self.last_reply: str = ""
         self._last_reported: str = ""
         self.last_activity = clock()
 
@@ -106,6 +112,10 @@ class TurnSession:
         d = decide(text, silence_s=silence, released=released,
                    thresholds=cfg.thresholds, model_says_complete=answer)
 
+        # Fire-and-forget, so the sentences are already judged by the time the pause
+        # ends rather than the flush waiting on a second model.
+        await self._judge_asides(cfg, released=released)
+
         if d.ask_model and cfg.uses_model and self._detector is not None:
             verdict = await self._detector.is_complete(text, cfg.model)
             async with self._lock:
@@ -129,14 +139,24 @@ class TurnSession:
             # would make the bot answer nothing at all.
             if not out.strip():
                 return
+            verdicts = self._judge.verdicts
             self._invalidate_answer()
+            self._judge.reset()
             self._last_reported = ""
 
+        # WHAT IS SHOWN IS ALWAYS THE WHOLE TURN; what is SENT may be less. The page
+        # strikes the asides through, so a wrong call is visible and arguable rather
+        # than a sentence that silently never happened.
+        send_text = surviving(out, verdicts) if cfg.drops_asides else out
+        dropped = len(out) - len(send_text)
         log.info("turn_flush", session=self.session_id[:8], reason=d.reason,
-                 chars=len(out), silence_ms=int(silence * 1000))
+                 chars=len(send_text), silence_ms=int(silence * 1000),
+                 aside_chars=dropped or None)
         if self._on_state:
-            await self._on_state("flushed", out)
-        await self._on_flush(out, d.reason)
+            await self._on_state("flushed", out, verdicts)
+        if not send_text.strip():
+            return
+        await self._on_flush(send_text, d.reason)
 
     async def _report_buffering(self) -> None:
         """Tell the page what is held but not yet sent, so a person can watch their
@@ -144,10 +164,39 @@ class TurnSession:
         if not self._on_state:
             return
         text = self.buf.text
-        if text == self._last_reported:
+        v = self._judge.verdicts
+        # Re-report when a VERDICT lands even though the text has not changed - the
+        # judgement arriving is itself the thing worth showing.
+        stamp = text + "\x00" + repr(sorted(v.items()))
+        if stamp == self._last_reported:
             return
-        self._last_reported = text
-        await self._on_state("buffering", text)
+        self._last_reported = stamp
+        await self._on_state("buffering", text, v)
+
+    # --- is any of this for us? --------------------------------------------------
+
+    async def _judge_asides(self, cfg: TurnConfig, released: bool = False) -> None:
+        """Judge completed sentences in the background, never in the decision path.
+
+        OFF the critical path on purpose. This is a second model call on a pipeline
+        whose entire budget is the length of a human pause, so it must never be
+        something the flush waits on - a verdict that has not arrived simply means
+        the segment is unjudged, which means kept.
+        """
+        if not cfg.judges_asides:
+            return
+        if self._judging and not self._judging.done():
+            return
+        pending = self._judge.unjudged(self.buf.text, include_last=released)
+        if not pending:
+            return
+
+        async def run():
+            for seg in pending:
+                await self._judge.judge(seg, self.last_reply, cfg.model)
+            await self._report_buffering()
+
+        self._judging = asyncio.create_task(run())
 
     # --- the clock ---------------------------------------------------------------
 
@@ -188,6 +237,17 @@ class SessionRegistry:
 
     def __init__(self):
         self._sessions: dict[str, TurnSession] = {}
+
+    def note_reply(self, session_id: str, text: str) -> None:
+        """What the assistant just said, kept for the relevance judge.
+
+        Without it a short answer is unjudgeable: "yes, do that" is a reply to the
+        last thing she said, and with no record of what that was it looks exactly like
+        a fragment of someone else's conversation.
+        """
+        s = self._sessions.get(session_id)
+        if s is not None and text:
+            s.last_reply = str(text)[-400:]
 
     def get(self, session_id: str, factory) -> TurnSession:
         s = self._sessions.get(session_id)

@@ -29,10 +29,25 @@ class TurnConfig:
     enabled: bool = False
     model: str = ""
     thresholds: Thresholds = None
+    # Judge whether what was heard was addressed to us at all. OFF by default: it can
+    # only ever remove words a person said, so it is opted into deliberately.
+    relevance: bool = False
+    # What a verdict DOES. 'mark' shows the judgement on the page and still sends
+    # everything; 'drop' also withholds the marked segments. 'mark' is the default so
+    # the behaviour can be watched for a while before it is allowed to cost anything.
+    relevance_action: str = "mark"
 
     def __post_init__(self):
         if self.thresholds is None:
             self.thresholds = Thresholds()
+
+    @property
+    def drops_asides(self) -> bool:
+        return bool(self.relevance and self.model and self.relevance_action == "drop")
+
+    @property
+    def judges_asides(self) -> bool:
+        return bool(self.relevance and self.model)
 
     @property
     def uses_model(self) -> bool:
@@ -68,6 +83,8 @@ class ConfigCache:
                     punct_silence=float(d.get("punct_silence_ms", 500)) / 1000.0,
                     max_silence=float(d.get("max_silence_ms", 1200)) / 1000.0,
                 ),
+                relevance=bool(d.get("relevance_enabled")),
+                relevance_action=str(d.get("relevance_action") or "mark"),
             )
             self._warned = False
         except Exception as e:

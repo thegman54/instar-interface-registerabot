@@ -761,7 +761,8 @@ _turn_sessions = TurnSessionRegistry()
 
 def build_turn_state_envelope(original: dict, bot_slug: str,
                               state: str, text: str,
-                              max_silence_ms: int = 0) -> dict:
+                              max_silence_ms: int = 0,
+                              asides: list = None, dropping: bool = False) -> dict:
     """Tell the page what is held and what has been committed.
 
     This is the visible half of the whole feature. Without it the buffering is
@@ -781,8 +782,14 @@ def build_turn_state_envelope(original: dict, bot_slug: str,
         # threshold rather than letting the browser assume one: a sweep that finishes
         # at a different moment than the flush is worse than no sweep, because it
         # teaches the visitor a timing that is not real.
+        # `asides` are the segments judged not to have been addressed to us. They are
+        # sent so the page can STRIKE THEM THROUGH - never so it can delete them. A
+        # wrong call has to stay visible, or the assistant simply appears to ignore
+        # things that were on screen a second ago. `dropping` says whether the verdict
+        # actually withheld them from the bot or was only displayed.
         'payload': json.dumps({'state': state, 'text': text,
-                               'max_silence_ms': max_silence_ms}),
+                               'max_silence_ms': max_silence_ms,
+                               'asides': asides or [], 'dropping': bool(dropping)}),
     }
 
 
@@ -811,11 +818,17 @@ async def handle_stt_frame(envelope: dict, ws, bot_slug: str) -> None:
         turn.pop('payload', None)
         await handle_message(turn, ws, bot_slug)
 
-    async def on_state(state: str, state_text: str) -> None:
+    async def on_state(state: str, state_text: str, verdicts: dict = None) -> None:
         try:
-            ms = int((await _turn_config.get()).thresholds.max_silence * 1000)
-            await ws.send(json.dumps(
-                build_turn_state_envelope(envelope, bot_slug, state, state_text, ms)))
+            cfg = await _turn_config.get()
+            ms = int(cfg.thresholds.max_silence * 1000)
+            # Only the ASIDES travel. The page keeps everything on screen and strikes
+            # these through, so sending the segments judged relevant would be the whole
+            # transcript a second time for no added meaning.
+            asides = [s for s, keep in (verdicts or {}).items() if not keep]
+            await ws.send(json.dumps(build_turn_state_envelope(
+                envelope, bot_slug, state, state_text, ms,
+                asides=asides, dropping=cfg.drops_asides)))
         except Exception as e:
             log.debug("turn_state_send_failed", error=str(e))
 
@@ -1159,6 +1172,13 @@ async def send_response(ws, original_envelope: dict, bot_slug: str, text: str, s
     progress rather than discarding a completed turn. Losing an answer is far more
     expensive than a few seconds of retry.
     """
+    # Context for the relevance judge: a short reply like "yes, do that" is only
+    # recognisable as a reply if something remembers what it is replying to.
+    try:
+        _turn_sessions.note_reply(original_envelope.get('session_id', ''), spoken or text)
+    except Exception:                                            # noqa: BLE001
+        pass
+
     response_envelope = build_response_envelope(
         original_envelope, bot_slug, text, spoken,
         attachments=attachments, audio_base64=audio_base64,
