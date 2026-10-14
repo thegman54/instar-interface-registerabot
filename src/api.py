@@ -392,6 +392,35 @@ _idle_b64_cache: dict = {}
 IDLE_CACHE_TTL = float(os.environ.get('IDLE_CACHE_TTL', '60'))
 
 
+async def _send_head_kind(ws, envelope: dict, bot_slug: str, kind: str) -> None:
+    """Tell the page WHICH KIND OF HEAD this bot has: 'video' or 'rig'.
+
+    The page cannot work this out for itself — `face_enabled` lives in the gatekeeper's
+    database and the page is served by the relay — so it used to guess with a timer: wait
+    four seconds, and if no rest clip had arrived, download the 3D rig. That guess costs
+    three.js, three-vrm and an 11MB character on every video-head conversation where the
+    first turn happened to be slow, which is exactly the cost the video head exists to
+    avoid.
+
+    Saying so explicitly removes the guess. Nothing speculative is ever fetched: a bot with
+    a rendered head sends rest clips and the rig is never touched, and a bot without one
+    says 'rig' and the page loads it at once instead of after a four-second wait.
+    """
+    try:
+        await ws.send(json.dumps({
+            'v': 1,
+            'type': 'head',
+            'session_id': envelope.get('session_id', ''),
+            'timestamp': int(time.time() * 1000),
+            'from': {'kind': 'bot', 'slug': bot_slug},
+            'to': envelope.get('from', {}),
+            'encrypted': False,
+            'payload': json.dumps({'kind': kind}),
+        }))
+    except Exception as e:                                       # noqa: BLE001
+        log.warning("head_kind_send_failed", error=str(e), kind=kind, bot=bot_slug)
+
+
 async def _idle_variants(client, face_url: str, avatar_id: str) -> list:
     """Which rest clips this avatar has. [0] when the renderer has no playlist endpoint.
 
@@ -823,9 +852,12 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     # frame and buys a head that is alive while she thinks.
     _cached_face = _face_cfg_by_slug.get(bot_slug)
     if _cached_face:
-        asyncio.create_task(
-            _send_idle_frame(ws, envelope, bot_slug, _cached_face['face_avatar_id'])
-        )
+        if _cached_face.get('face_avatar_id'):
+            asyncio.create_task(
+                _send_idle_frame(ws, envelope, bot_slug, _cached_face['face_avatar_id'])
+            )
+        else:
+            asyncio.create_task(_send_head_kind(ws, envelope, bot_slug, 'rig'))
     session_id = envelope.get('session_id', '')
     messages, source_info = extract_messages_from_envelope(envelope)
     user_context = extract_user_context_from_envelope(envelope)
@@ -943,6 +975,18 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                 if face_on and _face_cfg_by_slug.get(bot_slug) != face_cfg:
                     _face_cfg_by_slug[bot_slug] = face_cfg
                     _save_face_cache()
+                elif not face_on:
+                    # Remember the ABSENCE too, so the next turn can tell the page to load
+                    # the rig at the start rather than after the gatekeeper has answered.
+                    if _face_cfg_by_slug.get(bot_slug) is not None and \
+                            _face_cfg_by_slug[bot_slug].get('face_avatar_id'):
+                        _face_cfg_by_slug[bot_slug] = {}
+                        _save_face_cache()
+                    elif bot_slug not in _face_cfg_by_slug:
+                        _face_cfg_by_slug[bot_slug] = {}
+                        _save_face_cache()
+                    # No rendered head: this is the one case where the rig IS the avatar.
+                    asyncio.create_task(_send_head_kind(ws, envelope, bot_slug, 'rig'))
 
                 # Option A: generate TTS inline and embed it in the response envelope so
                 # audio reaches synchronous /ask clients (the platform assistant). Also emit
