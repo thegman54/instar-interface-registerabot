@@ -33,6 +33,18 @@ services:
       # single clip is the only thing that sounds right, so make the whole render faster
       # rather than cutting it up. Override via the TOOL-EXECUTOR service's env.
       - FACE_CHUNKED=${FACE_CHUNKED:-0}
+      # WHICH TALKING-HEAD ENGINE RENDERS THE REPLY.
+      #
+      # Defaults to float-renderer, not the MuseTalk one it used to reach implicitly.
+      # MuseTalk moves the mouth and nothing else: in photo mode the head is frozen and
+      # never blinks, which is why an idle loop had to be built and crossfaded separately.
+      # FLOAT generates blinks and head motion from the audio. Measured on one portrait
+      # and 7.6s of speech: 25fps against 12 and 50% more mouth motion; on 8s of silence,
+      # four blinks against none.
+      #
+      # Both speak the same HTTP contract, so this is a URL change and nothing else.
+      # Point it back at http://instar-face-renderer:8088 to return to MuseTalk.
+      - FACE_RENDERER_URL=${FACE_RENDERER_URL:-http://instar-float-renderer:8098}
       - PORT=8091
     ports:
       - "8091:8091"
