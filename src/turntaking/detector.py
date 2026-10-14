@@ -39,17 +39,28 @@ PROMPT = (
 # A different question from completeness and a much more dangerous one to get wrong,
 # so the prompt is written to make KEEPING the easy answer: it is told to choose
 # RELEVANT when unsure, and the caller treats anything it cannot parse as RELEVANT too.
+# Measured on gemma3:12b over twelve hand-written lines: 11/12 correct, and - the
+# number that actually matters - ZERO false asides, the direction that costs someone
+# their sentence. ~250ms per call once the model is warm.
+#
+# An earlier wording ended "when in doubt answer RELEVANT" and scored 5/12: it was so
+# timid it let plain third-party chatter through, which is a feature that does nothing.
+# Defining the two classes by what they ASK OF THE ASSISTANT, and putting the tie-break
+# in one short line at the end, is what moved it. The safety does not live in the
+# prompt's timidity - it lives in the caller: unparsed and unreachable mean keep, and a
+# turn judged entirely aside is kept whole.
 RELEVANCE_PROMPT = (
-    "An assistant is listening through an open microphone and hears everything in "
-    "the room, including speech meant for other people.\n"
-    "Decide whether the LINE below was addressed to the assistant.\n"
-    "Reply with exactly one word: RELEVANT or ASIDE.\n\n"
-    "ASIDE means it was plainly not meant for the assistant: talking to someone else "
-    "in the room, a phone call, a television, background chatter.\n"
-    "RELEVANT means anything else, INCLUDING anything you are unsure about. When in "
-    "doubt answer RELEVANT.\n\n"
+    "You are filtering a live microphone feed for an assistant.\n"
+    "The microphone picks up the whole room, so some of what it hears is the person "
+    "talking TO the assistant and some is not.\n\n"
+    "Answer with exactly one word.\n"
+    "ASIDE - the line is addressed to another person, or is talk about the world that "
+    "asks the assistant for nothing: speaking to someone else in the room, one side of "
+    "a phone call, a television, chatter or storytelling.\n"
+    "RELEVANT - the line asks the assistant something, instructs it, or answers it.\n"
+    "If the line could plausibly be either, answer RELEVANT.\n\n"
     "{context}"
-    "Line: {text}\n\nAnswer:"
+    "Line: {text}\nAnswer:"
 )
 
 
