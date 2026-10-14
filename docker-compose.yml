@@ -45,7 +45,12 @@ services:
       # Both speak the same HTTP contract, so this is a URL change and nothing else.
       # Point it back at http://instar-face-renderer:8088 to return to MuseTalk.
       - FACE_RENDERER_URL=${FACE_RENDERER_URL:-http://instar-float-renderer:8098}
+      # Where the face-config cache lives. On a volume, not /tmp: the cache exists to
+      # cover the gap after a restart, and a restart is exactly when /tmp is emptied.
+      - FACE_CFG_CACHE=/state/face_cfg_by_slug.json
       - PORT=8091
+    volumes:
+      - registerabot_state:/state
     ports:
       - "8091:8091"
     healthcheck:
@@ -66,3 +71,6 @@ networks:
     external: true
   instar-bot:
     external: true
+
+volumes:
+  registerabot_state:

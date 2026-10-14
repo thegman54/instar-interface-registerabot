@@ -420,6 +420,33 @@ async def _send_idle_frame(ws, envelope: dict, bot_slug: str, avatar_id: str) ->
 # The first turn after a restart still pays the old behaviour; every turn after is instant.
 _face_cfg_by_slug: dict = {}
 
+# ...and remembered on DISK, because an in-memory cache is empty exactly when it matters.
+#
+# The cache is populated from a completed turn. So after any restart the first visitor
+# gets no rest loop at all - the page sits on whatever frame it had, which is the very
+# thing the loop exists to prevent. Restarts are not rare here: every deploy is one.
+_FACE_CFG_PATH = os.environ.get('FACE_CFG_CACHE', '/tmp/face_cfg_by_slug.json')
+
+
+def _load_face_cache() -> None:
+    try:
+        with open(_FACE_CFG_PATH) as fh:
+            _face_cfg_by_slug.update(json.load(fh))
+        log.info("face_cache_loaded", bots=len(_face_cfg_by_slug))
+    except Exception:
+        pass
+
+
+def _save_face_cache() -> None:
+    try:
+        with open(_FACE_CFG_PATH, 'w') as fh:
+            json.dump(_face_cfg_by_slug, fh)
+    except Exception as e:
+        log.debug("face_cache_save_failed", error=str(e))
+
+
+_load_face_cache()
+
 
 async def _get_face_config(voice_group_id: str) -> dict:
     """Fetch {face_enabled, face_avatar_id} for a voice group (empty on any failure)."""
@@ -876,8 +903,9 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                 # twice. Check up front so we can decide before sending anything.
                 face_cfg = await _get_face_config(voice_group_id) if voice_group_id else {}
                 face_on = bool(face_cfg.get('face_enabled') and face_cfg.get('face_avatar_id'))
-                if face_on:
+                if face_on and _face_cfg_by_slug.get(bot_slug) != face_cfg:
                     _face_cfg_by_slug[bot_slug] = face_cfg
+                    _save_face_cache()
 
                 # Option A: generate TTS inline and embed it in the response envelope so
                 # audio reaches synchronous /ask clients (the platform assistant). Also emit
