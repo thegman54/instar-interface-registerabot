@@ -359,9 +359,20 @@ async def _send_media_status(ws, envelope: dict, bot_slug: str, stage: str, stat
         log.debug("media_status_send_failed", error=str(e), stage=stage, state=state, bot=bot_slug)
 
 
-def build_idle_envelope(original_envelope: dict, bot_slug: str, video_base64: str) -> dict:
+def build_idle_envelope(original_envelope: dict, bot_slug: str, video_base64: str,
+                        variant: int = None, count: int = None) -> dict:
     """A looping mouth-closed idle clip for the avatar circle (browser loops it between
-    turns so she's always present). Optional/additive; clients ignore unknown types."""
+    turns so she's always present). Optional/additive; clients ignore unknown types.
+
+    `variant` is what turns this from one clip into a playlist: the renderer builds several
+    rest clips that all start and end on the same frame, and a stamped frame ACCUMULATES on
+    the page instead of replacing what is there. Unstamped keeps the old behaviour, so a
+    renderer that has only one loop still works.
+    """
+    payload = {'format': 'mp4', 'base64': video_base64}
+    if variant is not None:
+        payload['variant'] = variant
+        payload['count'] = count
     return {
         'v': 1,
         'type': 'idle',
@@ -370,7 +381,7 @@ def build_idle_envelope(original_envelope: dict, bot_slug: str, video_base64: st
         'from': {'kind': 'bot', 'slug': bot_slug},
         'to': original_envelope.get('from', {}),
         'encrypted': False,
-        'payload': json.dumps({'format': 'mp4', 'base64': video_base64}),
+        'payload': json.dumps(payload),
     }
 
 
@@ -381,29 +392,55 @@ _idle_b64_cache: dict = {}
 IDLE_CACHE_TTL = float(os.environ.get('IDLE_CACHE_TTL', '60'))
 
 
+async def _idle_variants(client, face_url: str, avatar_id: str) -> list:
+    """Which rest clips this avatar has. [0] when the renderer has no playlist endpoint.
+
+    Capped, because every clip crosses the WebSocket as base64 inside the first turn and
+    the point of the playlist is variety, not completeness — six clips of twelve seconds is
+    over a minute before anything repeats.
+    """
+    try:
+        r = await client.get(f"{face_url}/avatars/{avatar_id}/idle-playlist")
+        if r.status_code == 200:
+            vs = [int(v) for v in (r.json() or {}).get('variants') or []]
+            if vs:
+                return vs[:int(os.environ.get('IDLE_MAX_CLIPS', '6'))]
+    except Exception:
+        pass
+    return [0]
+
+
 async def _send_idle_frame(ws, envelope: dict, bot_slug: str, avatar_id: str) -> None:
-    """Fetch (and cache) the avatar's idle loop and send it so the browser can loop it
-    between turns. First fetch triggers a one-time render on the face-renderer."""
+    """Fetch (and cache) the avatar's rest clips and send them so the browser can cycle
+    them between turns. First fetch triggers a one-time render on the face-renderer."""
     import base64
     face_url = os.environ.get('FACE_RENDERER_URL', 'http://instar-face-renderer:8088')
     try:
-        cached = _idle_b64_cache.get(avatar_id)
-        b64 = cached[0] if cached and (time.time() - cached[1]) < IDLE_CACHE_TTL else None
-        if not b64:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.get(f"{face_url}/avatars/{avatar_id}/idle")
-            if r.status_code != 200:
-                # Was a silent return — a missing idle then looked identical to a working
-                # one, and the browser just showed nothing.
-                log.warning("idle_fetch_failed", status=r.status_code, avatar=avatar_id, bot=bot_slug)
-                if cached:
-                    b64 = cached[0]  # serve the stale copy rather than nothing
-                else:
-                    return
-            else:
-                b64 = base64.b64encode(r.content).decode()
-                _idle_b64_cache[avatar_id] = (b64, time.time())
-        await ws.send(json.dumps(build_idle_envelope(envelope, bot_slug, b64)))
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            variants = await _idle_variants(client, face_url, avatar_id)
+            single = len(variants) < 2
+            for v in variants:
+                key = (avatar_id, v)
+                cached = _idle_b64_cache.get(key)
+                b64 = cached[0] if cached and (time.time() - cached[1]) < IDLE_CACHE_TTL else None
+                if not b64:
+                    r = await client.get(f"{face_url}/avatars/{avatar_id}/idle",
+                                         params={'variant': v})
+                    if r.status_code != 200:
+                        # Was a silent return — a missing idle then looked identical to a
+                        # working one, and the browser just showed nothing.
+                        log.warning("idle_fetch_failed", status=r.status_code,
+                                    avatar=avatar_id, variant=v, bot=bot_slug)
+                        if not cached:
+                            continue
+                        b64 = cached[0]      # serve the stale copy rather than nothing
+                    else:
+                        b64 = base64.b64encode(r.content).decode()
+                        _idle_b64_cache[key] = (b64, time.time())
+                await ws.send(json.dumps(build_idle_envelope(
+                    envelope, bot_slug, b64,
+                    variant=None if single else v,
+                    count=None if single else len(variants))))
     except Exception as e:
         log.warning("idle_frame_error", error=str(e), bot=bot_slug)
 
