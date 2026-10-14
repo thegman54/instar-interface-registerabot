@@ -408,6 +408,19 @@ async def _send_idle_frame(ws, envelope: dict, bot_slug: str, avatar_id: str) ->
         log.warning("idle_frame_error", error=str(e), bot=bot_slug)
 
 
+# Last known face config per BOT SLUG, so the rest loop can go out at the start of a turn
+# instead of at the end of one.
+#
+# The config is keyed by voice group, and the voice group only arrives in the gatekeeper's
+# RESPONSE - which is after the bot has finished thinking. Sending the idle frame there
+# meant the page had nothing to show for the whole turn: she sat frozen on her last frame
+# through every pause, which is the single most dead-looking thing a talking head can do.
+#
+# A bot's avatar does not change between turns in practice, so remembering it is enough.
+# The first turn after a restart still pays the old behaviour; every turn after is instant.
+_face_cfg_by_slug: dict = {}
+
+
 async def _get_face_config(voice_group_id: str) -> dict:
     """Fetch {face_enabled, face_avatar_id} for a voice group (empty on any failure)."""
     admin = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
@@ -738,6 +751,17 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     5. Wrap response in envelope, send back through relay
     6. Record response with gatekeeper
     """
+    # REST LOOP FIRST, before the bot has said anything.
+    #
+    # Rendering a reply takes seconds. Without this the page holds whatever frame she
+    # ended on - or an empty circle on the very first turn - for that entire time. The
+    # loop is already built and cached by the renderer, so sending it here costs one
+    # frame and buys a head that is alive while she thinks.
+    _cached_face = _face_cfg_by_slug.get(bot_slug)
+    if _cached_face:
+        asyncio.create_task(
+            _send_idle_frame(ws, envelope, bot_slug, _cached_face['face_avatar_id'])
+        )
     session_id = envelope.get('session_id', '')
     messages, source_info = extract_messages_from_envelope(envelope)
     user_context = extract_user_context_from_envelope(envelope)
@@ -852,6 +876,8 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                 # twice. Check up front so we can decide before sending anything.
                 face_cfg = await _get_face_config(voice_group_id) if voice_group_id else {}
                 face_on = bool(face_cfg.get('face_enabled') and face_cfg.get('face_avatar_id'))
+                if face_on:
+                    _face_cfg_by_slug[bot_slug] = face_cfg
 
                 # Option A: generate TTS inline and embed it in the response envelope so
                 # audio reaches synchronous /ask clients (the platform assistant). Also emit
