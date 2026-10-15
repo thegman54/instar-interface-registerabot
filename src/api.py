@@ -15,6 +15,7 @@ Message flow:
 import os
 import json
 import asyncio
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -899,6 +900,49 @@ def build_turn_state_envelope(original: dict, bot_slug: str,
     }
 
 
+# Characters an action id may contain. It arrives from the BROWSER, is written into a
+# turn, and is the thing the bot keys its behaviour on - so it is bounded here rather
+# than trusted. A visitor with devtools can emit any id; that is inherent, and the rule
+# is the same as a chat link's: it says what happened, it grants nothing.
+_ACTION_ID_OK = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+async def handle_ui_event(envelope: dict, ws, bot_slug: str) -> None:
+    """Someone pressed something on the page.
+
+    Becomes an ordinary turn, so history, hints, identity and timeouts all stay on the
+    one road into the gatekeeper rather than this inventing a second one.
+    """
+    try:
+        payload = envelope.get('payload')
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        payload = payload if isinstance(payload, dict) else {}
+    except Exception:
+        payload = {}
+
+    action_id = str(payload.get('action_id') or '').strip()
+    label = str(payload.get('label') or '').strip()[:120]
+    value = str(payload.get('value') or '').strip()[:500]
+
+    if not _ACTION_ID_OK.match(action_id):
+        log.warning("ui_event_bad_action_id", raw=action_id[:40], bot=bot_slug)
+        return
+
+    # What the bot reads. The marker is APPENDED, never prepended: with it first,
+    # whitespace collapse slides the visitor's own words inside the brackets and the
+    # bot correctly reads its user's text as an injected directive and refuses it.
+    said = value or label or action_id
+    text = f"{said} [control:{action_id}]"
+
+    turn = dict(envelope)
+    turn['type'] = 'chat_request'
+    turn['messages'] = [{'role': 'user', 'content': text}]
+    turn.pop('payload', None)
+    log.info("ui_event", bot=bot_slug, action=action_id, has_value=bool(value))
+    await handle_message(turn, ws, bot_slug)
+
+
 async def handle_stt_frame(envelope: dict, ws, bot_slug: str) -> None:
     """A partial, a final, or a release from the browser's recogniser."""
     session_id = envelope.get('session_id', '')
@@ -1485,6 +1529,11 @@ class HostConnection:
                 return
             task = asyncio.create_task(handle_message(data, ws, slug))
             task.add_done_callback(_log_task_exception)
+        elif mtype == 'ui_event':
+            ev_slug = (data.get('to') or {}).get('slug') or slug
+            if ev_slug:
+                task = asyncio.create_task(handle_ui_event(data, ws, ev_slug))
+                task.add_done_callback(_log_task_exception)
         elif mtype in ('stt_partial', 'stt_final', 'stt_release'):
             # Speech as it arrives, on the HOST connection — which is the path every
             # bot actually uses. There are two dispatch sites in this file and only
