@@ -224,6 +224,28 @@ def build_response_envelope(
     }
 
 
+def build_reply_delta_envelope(original_envelope: dict, bot_slug: str, text: str) -> dict:
+    """Her reply so far, while she is still writing it.
+
+    Carries the WHOLE text each time rather than the increment. Deltas are small and a
+    dropped frame would otherwise desynchronise the page permanently; sending the
+    accumulated string makes every frame self-correcting and lets the page strip a
+    marker that is still half-written.
+
+    Optional/additive — a client that does not know 'reply_delta' ignores it and sees
+    the final response exactly as before."""
+    return {
+        'v': 1,
+        'type': 'reply_delta',
+        'session_id': original_envelope.get('session_id', ''),
+        'timestamp': int(time.time() * 1000),
+        'from': {'kind': 'bot', 'slug': bot_slug},
+        'to': original_envelope.get('from', {}),
+        'encrypted': False,
+        'payload': json.dumps({'text': text}),
+    }
+
+
 def build_status_envelope(original_envelope: dict, bot_slug: str, text: str) -> dict:
     """A lightweight progress frame ('working on it…') routed back to the sender.
     Optional/additive — clients that don't understand 'status' just ignore it."""
@@ -651,6 +673,70 @@ def _friendly_step(raw: str, tool_input: dict) -> str:
     return name.replace('vgx_', '').replace('_', ' ').strip() or 'working'
 
 
+# Which content blocks are TEXT. The stream carries her thinking as content_block_delta
+# too, so "forward every delta" would pipe her private reasoning into a visitor's
+# browser. Proven, not guessed - a one-line prompt produced:
+#
+#   block_start idx 0 -> thinking     thinking_delta, signature_delta
+#   block_start idx 1 -> text         text_delta x4
+#
+# So this tracks which block index is text and forwards only deltas on that index whose
+# delta.type is text_delta. DEFAULT-DENY: an unrecognised block or delta type is
+# dropped, because this stream is a debug channel carrying the inside of a turn and the
+# page is shown to a visitor.
+def _reply_text_deltas(event, text_blocks: set) -> list[str]:
+    """Text she has written, from one stream-json event. Mutates text_blocks."""
+    if not isinstance(event, dict) or event.get('type') != 'stream_event':
+        return []
+    ev = event.get('event') or {}
+    kind = ev.get('type')
+
+    if kind == 'content_block_start':
+        blk = ev.get('content_block') or {}
+        idx = ev.get('index')
+        if blk.get('type') == 'text':
+            text_blocks.add(idx)
+        else:
+            text_blocks.discard(idx)      # thinking, tool_use, anything else
+        return []
+
+    if kind == 'content_block_delta':
+        idx = ev.get('index')
+        if idx not in text_blocks:
+            return []                      # not a text block - say nothing
+        d = ev.get('delta') or {}
+        if d.get('type') != 'text_delta':
+            return []                      # belt and braces: only text_delta carries speech
+        t = d.get('text')
+        return [t] if isinstance(t, str) and t else []
+
+    return []
+
+
+# She marks the spoken summary inline. Mid-stream those brackets are just characters,
+# so without this the visitor watches "[SPOKEN]" get typed out. The marker can also be
+# SPLIT across deltas, which is why this works on the accumulated text and truncates at
+# a dangling opener rather than trying to strip each fragment.
+def _strip_spoken(buf: str) -> str:
+    out = buf
+    for open_tag, close_tag in (('[SPOKEN]', '[/SPOKEN]'), ('<spoken>', '</spoken>')):
+        while True:
+            i = out.find(open_tag)
+            if i < 0:
+                break
+            j = out.find(close_tag, i)
+            if j < 0:
+                out = out[:i]              # still being written - hide the rest for now
+                break
+            out = out[:i] + out[j + len(close_tag):]
+    # A partially-arrived opener, e.g. "[SPO", must not flash on screen either.
+    for tag in ('[SPOKEN]', '<spoken>'):
+        for n in range(len(tag) - 1, 0, -1):
+            if out.endswith(tag[:n]):
+                return out[:-n]
+    return out
+
+
 def _find_tool_uses(event) -> list[tuple[str, dict]]:
     """Walk a claude stream-json event for (name, input) of tool_use blocks."""
     uses: list[tuple[str, dict]] = []
@@ -681,6 +767,11 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
     # narration (a second snapshot query, the plan dry-run, etc.), but we don't spam
     # the same phrase twice in a row.
     last_phrase: str | None = None
+    # Streaming-reply state. _text_blocks tracks which content-block indices are TEXT,
+    # so a thinking block can never be mistaken for speech.
+    _text_blocks: set = set()
+    _reply_buf: list = []
+    _last_shown = ['']
     # Narration state. TTS runs OFF the read loop so a slow synth never delays the next
     # status line, but clips are serialised behind one lock so they arrive — and therefore
     # play — in the order the steps actually happened.
@@ -708,6 +799,21 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                     continue
                 if msg.get('type') != 'output' or msg.get('conversation_id') != conversation_id:
                     continue
+
+                # Her words, as she writes them. This loop was already open and already
+                # filtering this stream for tool narration; the text was flowing past it
+                # unexamined.
+                for piece in _reply_text_deltas(msg.get('event', {}), _text_blocks):
+                    _reply_buf.append(piece)
+                    shown = _strip_spoken(''.join(_reply_buf))
+                    if shown and shown != _last_shown[0]:
+                        _last_shown[0] = shown
+                        try:
+                            await relay_ws.send(json.dumps(
+                                build_reply_delta_envelope(envelope, bot_slug, shown)))
+                        except Exception:
+                            return
+
                 for name, tool_input in _find_tool_uses(msg.get('event', {})):
                     # Prefer the bot's own stated intent ('why', <=15 words) — real
                     # narration. Fall back to the per-tool phrase only when absent.
