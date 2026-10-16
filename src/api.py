@@ -31,6 +31,7 @@ import structlog
 from .turntaking.config import ConfigCache as TurnConfigCache
 from .turntaking.detector import TurnDetector
 from .turntaking.session import SessionRegistry as TurnSessionRegistry, TurnSession
+from .cues import CueLibrary, class_for_tool
 
 
 # =============================================================================
@@ -406,6 +407,77 @@ def build_idle_envelope(original_envelope: dict, bot_slug: str, video_base64: st
         'encrypted': False,
         'payload': json.dumps(payload),
     }
+
+
+def build_cue_clip_envelope(original_envelope: dict, bot_slug: str, clip: dict) -> dict:
+    """One pre-rendered filler clip, for the page to hold until it wants it.
+
+    Sent once per conversation, before the first cue can fire. A clip fetched at cue time
+    would arrive after the moment it exists to cover, so the only useful delivery is early
+    and in advance.
+    """
+    return {
+        'v': 1,
+        'type': 'cue_clip',
+        'session_id': original_envelope.get('session_id', ''),
+        'timestamp': int(time.time() * 1000),
+        'from': {'kind': 'bot', 'slug': bot_slug},
+        'to': original_envelope.get('from', {}),
+        'encrypted': False,
+        'payload': json.dumps(clip),
+    }
+
+
+def build_cue_envelope(original_envelope: dict, bot_slug: str, cue_class: str) -> dict:
+    """A SUGGESTION that now might be a good moment for a filler clip of this class.
+
+    Carries the class and nothing else — no phrase, no clip, no instruction to play. The
+    page owns whether anything happens: it knows what is on screen, whether she is already
+    speaking, and how long ago the last one went, and the server knows none of that. A
+    turn with six tool calls sends six cues and should usually produce one clip.
+    """
+    return {
+        'v': 1,
+        'type': 'cue',
+        'session_id': original_envelope.get('session_id', ''),
+        'timestamp': int(time.time() * 1000),
+        'from': {'kind': 'bot', 'slug': bot_slug},
+        'to': original_envelope.get('from', {}),
+        'encrypted': False,
+        'payload': json.dumps({'cue_class': cue_class}),
+    }
+
+
+# The clip library, and which conversations have already been sent it. Keyed by session so
+# a reconnecting page gets it again — it holds the clips in memory, not on disk.
+CUES = CueLibrary()
+_cues_sent: dict = {}
+CUES_RESEND_AFTER = 1800.0
+
+
+async def _send_cue_clips(ws, envelope: dict, bot_slug: str,
+                          voice_group_id: str, avatar_id: str) -> None:
+    """Build the library if needed, then push whatever exists to this page, once.
+
+    Build runs off the turn path and takes ~25s the first time for a voice. The first turn
+    of a brand-new voice therefore gets no cues, which is correct: better nothing than a
+    clip that arrives late and plays over her answer.
+    """
+    try:
+        session = envelope.get('session_id', '')
+        last = _cues_sent.get((session, voice_group_id, avatar_id))
+        if last and (time.time() - last) < CUES_RESEND_AFTER:
+            return
+        await CUES.ensure(voice_group_id, avatar_id)
+        clips = CUES.manifest(voice_group_id, avatar_id)
+        if not clips:
+            return
+        for clip in clips:
+            await ws.send(json.dumps(build_cue_clip_envelope(envelope, bot_slug, clip)))
+        _cues_sent[(session, voice_group_id, avatar_id)] = time.time()
+        log.info("cue_clips_sent", bot=bot_slug, count=len(clips), avatar=avatar_id)
+    except Exception as e:                                            # noqa: BLE001
+        log.warning("cue_clips_error", error=str(e), bot=bot_slug)
 
 
 # avatar_id -> (base64 idle mp4, fetched_at). TTL'd, NOT permanent: the idle is retuned
@@ -829,7 +901,27 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                         await relay_ws.send(json.dumps(build_status_envelope(envelope, bot_slug, phrase)))
                     except Exception:
                         return
-                    # Voice it behind the text, never in front of it.
+
+                    # The phrase is for READING. What gets SPOKEN is chosen from a closed
+                    # set of pre-rendered clips by action class, because her `why` is
+                    # written for a log and sounds wrong out loud — "Alex asked to search
+                    # captain's logs for..." narrated in third person at the person who
+                    # asked. Send the class; the page decides if anything plays.
+                    #
+                    # Deliberately NOT gated on `phrase == last_phrase` like the status
+                    # line above: a repeated phrase is still a step that happened, and
+                    # suppressing its cue would hide real progress. The pacing that stops
+                    # her chattering is a timer in the browser, where it can see whether
+                    # she is already talking.
+                    try:
+                        await relay_ws.send(json.dumps(
+                            build_cue_envelope(envelope, bot_slug, class_for_tool(name))))
+                    except Exception:
+                        return
+
+                    # Live TTS of the phrase. OFF by default and kept only as an escape
+                    # hatch: measured on a real turn it fired four times in six seconds,
+                    # spoke her log-voice verbatim, and repeated itself. Cues replaced it.
                     if voice_group and len(phrase) >= NARRATE_MIN_CHARS:
                         t = asyncio.create_task(_narrate(phrase))
                         t.add_done_callback(_log_task_exception)
@@ -1187,6 +1279,12 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                 if face_on:
                     avatar_id = face_cfg['face_avatar_id']
                     asyncio.create_task(_send_idle_frame(ws, envelope, bot_slug, avatar_id))
+                    # Filler clips for the NEXT turn. Sending them now is the whole point:
+                    # a cue is only useful if the clip is already in the browser.
+                    if voice_group_id:
+                        asyncio.create_task(
+                            _send_cue_clips(ws, envelope, bot_slug, voice_group_id, avatar_id)
+                        )
                     if audio_b64:
                         asyncio.create_task(
                             _render_and_send_video(ws, envelope, bot_slug, audio_b64, avatar_id)
