@@ -1433,6 +1433,9 @@ class HostConnection:
         self.connected: bool = False
         self.connected_since: float | None = None
         self.last_pong: float | None = None
+        # When the relay last told us what it is ACTUALLY serving, as opposed to when
+        # it last answered a ping. Kept apart on purpose - see routing_fresh().
+        self.last_slugs: float | None = None
         self._task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
         self._shutdown: bool = False
@@ -1575,6 +1578,7 @@ class HostConnection:
         elif mtype == 'slugs':
             # Routing truth from the relay — reconcile against our intent.
             self.last_pong = time.time()
+            self.last_slugs = time.time()
             await self._reconcile(data.get('attached') or [])
         elif 'error' in data:
             log.warning("host_relay_error", error=data.get('error'))
@@ -1592,10 +1596,34 @@ class HostConnection:
     def pong_age(self) -> float | None:
         return None if self.last_pong is None else time.time() - self.last_pong
 
+    def routing_age(self) -> float | None:
+        """How long since the relay last told us what it is actually serving."""
+        return None if self.last_slugs is None else time.time() - self.last_slugs
+
+    def routing_fresh(self) -> bool:
+        """Do we have a RECENT answer about routing, or only an old one?
+
+        This is the distinction that cost hours. A pong proves the control channel is
+        alive; it proves nothing about whether the relay is still serving our slugs.
+        Both used to refresh the same clock, so a relay answering pings while having
+        lost a binding looked perfectly healthy and `confirmed` went on reporting the
+        last good answer - which is exactly the state found on 2026-10-15: the adapter
+        said seven was confirmed and healthy while the relay returned 'Bot not
+        connected' to every visitor.
+        """
+        age = self.routing_age()
+        return age is not None and age <= HOST_PING_SECONDS * 3
+
     def healthy(self) -> bool:
-        """Connected AND the relay is still answering on the control channel."""
+        """Connected, answering, AND recently confirmed to be routing.
+
+        Unknown is not healthy. A status that cannot currently prove a slug is served
+        must not claim it is - reporting green on stale evidence is worse than
+        reporting unknown, because nothing ever investigates green.
+        """
         age = self.pong_age()
-        return bool(self.connected) and (age is None or age <= HOST_PING_SECONDS * 3)
+        alive = bool(self.connected) and (age is None or age <= HOST_PING_SECONDS * 3)
+        return alive and self.routing_fresh()
 
     async def _loop(self) -> None:
         while not self._shutdown:
@@ -1726,9 +1754,14 @@ class ConnectionManager:
             age = h.pong_age()
             return [{
                 'slug': s,
-                'connected': h.connected and s in h.confirmed,
+                'connected': bool(h.connected and h.routing_fresh() and s in h.confirmed),
                 'attach_requested': True,
-                'relay_confirmed': s in h.confirmed,
+                # confirmed ONLY counts when the evidence is current. Stale
+                # evidence reported as confirmation is what makes an outage invisible.
+                'relay_confirmed': bool(h.routing_fresh() and s in h.confirmed),
+                'routing_known': h.routing_fresh(),
+                'routing_age_seconds': (None if h.routing_age() is None
+                                        else int(h.routing_age())),
                 'socket_connected': h.connected,
                 'via': 'host',
                 'uptime_seconds': up,
