@@ -21,8 +21,12 @@ services:
       - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL:-wss://relay.registerabot.com}
       - GATEKEEPER_URL=${GATEKEEPER_URL:-http://gatekeeper:8080}
       - BOT_SERVICE_URL=${BOT_SERVICE_URL:-http://bot:8080}
-      # Speak each tool step aloud as it happens — one TTS call per step, so default OFF.
-      - REGISTERABOT_NARRATE_TOOLS=${REGISTERABOT_NARRATE_TOOLS:-0}
+      # Speak each tool step aloud as it happens. ON. It was off on the assumption that a
+      # TTS call per step was expensive; measured 2026-10-16 it is 0.42-0.63s for a short
+      # phrase, and it runs off the read loop behind its own lock, so it never delays the
+      # next status line or the reply. Consecutive identical phrases are already deduped,
+      # so a multi-step turn speaks once per DISTINCT step, not once per tool call.
+      - REGISTERABOT_NARRATE_TOOLS=${REGISTERABOT_NARRATE_TOOLS:-1}
       # Stream the talking head as several clips instead of one. OFF — tried 2026-08-17 and
       # backed out: the joins are audible. Each chunk is an independently encoded AAC track,
       # and AAC carries encoder delay + padding at every boundary, so playing clips back to
