@@ -470,6 +470,24 @@ def cues_forget_session(session_id: str) -> None:
         _cues_sent.pop(key, None)
 
 
+async def _send_cue_clips_for_slug(ws, envelope: dict, bot_slug: str,
+                                   avatar_id: str) -> None:
+    """Push the library when all we know is the bot, not its voice yet.
+
+    On arrival the voice group has not come back from /process — that only happens after
+    the turn — so look it up the same way narration does. Cached per slug, so this is one
+    request per container lifetime and not per visitor.
+    """
+    try:
+        voice_group_id = await _get_voice_group(bot_slug)
+        if not voice_group_id:
+            log.debug("cue_clips_no_voice", bot=bot_slug)
+            return
+        await _send_cue_clips(ws, envelope, bot_slug, voice_group_id, avatar_id)
+    except Exception as e:                                            # noqa: BLE001
+        log.warning("cue_clips_arrival_error", error=str(e), bot=bot_slug)
+
+
 async def _send_cue_clips(ws, envelope: dict, bot_slug: str,
                           voice_group_id: str, avatar_id: str) -> None:
     """Build the library if needed, then push whatever exists to this page, once.
@@ -1149,9 +1167,18 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
         message_count=len(messages),
     )
 
-    # A fresh page holds no filler clips, whatever this conversation was sent before.
+    # A FRESH PAGE: forget what this conversation was sent, and push the clips NOW.
+    #
+    # They used to go out at the END of a turn, alongside the rest loop, which made the
+    # first turn of every new page silent — the cue for its first tool call arrived about
+    # four seconds before the library did. Arrival is the right moment instead: nothing is
+    # in flight, the greeting is being composed anyway, and the clips are on disk, so this
+    # is a read and ~1MB of socket rather than a render.
     if any('[visitor_arrived]' in str(m.get('content', '')) for m in messages):
         cues_forget_session(session_id)
+        if _cached_face and _cached_face.get('face_avatar_id'):
+            asyncio.create_task(_send_cue_clips_for_slug(
+                ws, envelope, bot_slug, _cached_face['face_avatar_id']))
 
     # Flatten messages into a single string for the gatekeeper.
     # System messages (including [HINTS: ...] from chat link passphrases)
