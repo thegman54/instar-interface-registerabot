@@ -455,6 +455,21 @@ _cues_sent: dict = {}
 CUES_RESEND_AFTER = 1800.0
 
 
+def cues_forget_session(session_id: str) -> None:
+    """Forget that this conversation has the clips, so the next turn resends them.
+
+    Called on [visitor_arrived], which is the page saying it just loaded. Clips live in
+    browser memory as object URLs, but the session id is persisted in localStorage — so a
+    reload keeps the conversation and loses the library, and "already sent" would have
+    been true and wrong for the next half hour. The arrival marker is the only honest
+    signal that the far end is empty.
+    """
+    if not session_id:
+        return
+    for key in [k for k in _cues_sent if k[0] == session_id]:
+        _cues_sent.pop(key, None)
+
+
 async def _send_cue_clips(ws, envelope: dict, bot_slug: str,
                           voice_group_id: str, avatar_id: str) -> None:
     """Build the library if needed, then push whatever exists to this page, once.
@@ -1133,6 +1148,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
         bot=bot_slug,
         message_count=len(messages),
     )
+
+    # A fresh page holds no filler clips, whatever this conversation was sent before.
+    if any('[visitor_arrived]' in str(m.get('content', '')) for m in messages):
+        cues_forget_session(session_id)
 
     # Flatten messages into a single string for the gatekeeper.
     # System messages (including [HINTS: ...] from chat link passphrases)
