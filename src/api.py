@@ -669,17 +669,46 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
     Fire-and-forget; any failure is swallowed so it never affects the chat."""
     import base64
     face_url = os.environ.get('FACE_RENDERER_URL', 'http://instar-face-renderer:8088')
+    admin_url = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
     turn_id = f"{envelope.get('session_id', '')}:{int(time.time() * 1000)}"
     wav = base64.b64decode(audio_b64)
     await _send_media_status(ws, envelope, bot_slug, 'video', 'start')
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
             if not FACE_CHUNKED:
-                resp = await client.post(
-                    f"{face_url}/render",
-                    files={'audio': ('speech.wav', wav, 'audio/mpeg')},
-                    data={'avatar_id': avatar_id},
-                )
+                # Go through the gatekeeper's cached-render route rather than straight at
+                # the renderer. A render is a pure function of (audio bytes, avatar), and
+                # her short replies repeat verbatim constantly — but the cache lives in
+                # the gatekeeper (the /tts-cache mount and the index pool are there, not
+                # here), so this container could never use it. One internal hop buys a
+                # 3s render back on every repeat.
+                #
+                # Falls through to the renderer directly if that route is unavailable:
+                # losing the cache must not mean losing her face.
+                resp = None
+                try:
+                    resp = await client.post(
+                        f"{admin_url}/api/render/cached",
+                        files={'audio': ('speech.wav', wav, 'audio/wav')},
+                        data={'avatar_id': avatar_id, 'text': envelope.get('text') or ''},
+                    )
+                    if resp.status_code == 200:
+                        log.info("video_cache", result=resp.headers.get('X-Cache', '?'),
+                                 bot=bot_slug)
+                    else:
+                        log.debug("video_cache_route_failed", status=resp.status_code,
+                                  bot=bot_slug)
+                        resp = None
+                except Exception as e:
+                    log.debug("video_cache_route_error", error=str(e), bot=bot_slug)
+                    resp = None
+
+                if resp is None:
+                    resp = await client.post(
+                        f"{face_url}/render",
+                        files={'audio': ('speech.wav', wav, 'audio/mpeg')},
+                        data={'avatar_id': avatar_id},
+                    )
                 if resp.status_code != 200:
                     log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
                     return
