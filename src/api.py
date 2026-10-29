@@ -88,6 +88,11 @@ HOST_PING_SECONDS = int(os.environ.get('REGISTERABOT_HOST_PING_SECONDS', '30'))
 NARRATE_TOOLS = os.environ.get('REGISTERABOT_NARRATE_TOOLS', '').lower() in ('1', 'true', 'yes')
 # Skip trivially short phrases — narrating "thinking" is noise, not information.
 NARRATE_MIN_CHARS = int(os.environ.get('REGISTERABOT_NARRATE_MIN_CHARS', '12'))
+# One spoken opener per turn, in her own words, at the first tool call that states a `why`.
+# ON by default — unlike NARRATE_TOOLS above, this is capped at a single utterance and
+# costs nothing on a repeat, so the thing that made per-step narration expensive and
+# annoying does not apply. Kill switch, not a feature flag.
+SPEAK_OPENER = os.environ.get('REGISTERABOT_SPEAK_OPENER', '1').lower() not in ('0', 'false', 'no')
 
 # Upper bound the connector waits for a bot turn. The REAL budget is per-profile and
 # enforced by the gatekeeper (which returns within it); this ceiling just has to exceed
@@ -925,6 +930,46 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
             except Exception:
                 pass
 
+    # Has she already spoken once this turn? ONE opener, at the first tool call that
+    # states a `why`. Everything after it keeps the cheap treatment (status line + a
+    # pre-rendered cue clip).
+    #
+    # One, not every step, because speaking every step is exactly what was measured and
+    # switched off: four utterances in six seconds, repeating themselves, over the top of
+    # each other. The thing that was actually broken was the silence at the FRONT of a
+    # turn — tools run for well under a second (0.62s of a measured 32s turn) and the rest
+    # is her thinking, so the first line is the only one with a real gap to fill.
+    spoke_opener = [False]
+
+    async def _speak_opener(line: str) -> None:
+        """Say her own words, with her face, at the start of a turn.
+
+        Goes out as a 'video' frame rather than 'status_audio' because the page plays a
+        video mid-turn WITHOUT clearing busy (see playVideoPayload) — so her head moves,
+        she keeps the amber ring, and the final answer still arrives as its own frame
+        afterwards. status_audio would have left a frozen face talking.
+
+        Cancelled with the turn, deliberately: if the real answer lands before this
+        renders, the opener is no longer an opener and would talk over her. That makes it
+        self-tuning — a fast turn stays quiet, a slow one gets filled.
+        """
+        vg = await _get_voice_group(bot_slug)
+        if not vg:
+            return
+        audio = await _generate_tts(line, vg)
+        if not audio:
+            return
+        cfg = await _get_face_config(vg)
+        avatar = cfg.get('face_avatar_id') if cfg.get('face_enabled') else ''
+        if avatar:
+            # Same cached render route as a reply, so a repeated opener — and openers
+            # repeat constantly — costs 28ms instead of a 2.4s render.
+            await _render_and_send_video(relay_ws, envelope, bot_slug, audio, avatar)
+        else:
+            await relay_ws.send(json.dumps(
+                build_status_audio_envelope(envelope, bot_slug, line, audio)))
+        log.info("spoke_opener", bot=bot_slug, line=line[:60], face=bool(avatar))
+
     try:
         async with websockets.connect(ws_url, open_timeout=5) as tws:
             async for raw in tws:
@@ -964,22 +1009,41 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                     except Exception:
                         return
 
-                    # The phrase is for READING. What gets SPOKEN is chosen from a closed
-                    # set of pre-rendered clips by action class, because her `why` is
-                    # written for a log and sounds wrong out loud — "Alex asked to search
-                    # captain's logs for..." narrated in third person at the person who
-                    # asked. Send the class; the page decides if anything plays.
+                    # HER WORDS, ONCE, AT THE FRONT OF THE TURN.
+                    #
+                    # `why` used to be unspeakable — nothing told the model what register
+                    # to write it in, so it wrote minutes of a meeting ("Alex asked to see
+                    # his torrents") and saying that back to the person who just asked is
+                    # absurd. That is now specified at the source, in WHY_CONTRACT on every
+                    # tool description, so it arrives as speech: "Pulling your torrents now."
+                    #
+                    # Prefer it over the canned cue for this one call — a clip chosen by
+                    # action class is a stand-in for her having said nothing, and she just
+                    # said something. Skipping the cue here also stops the two cutting each
+                    # other off, since the page swaps the video source rather than queueing.
+                    spoke_this_call = False
+                    if SPEAK_OPENER and why and not spoke_opener[0]:
+                        spoke_opener[0] = True
+                        spoke_this_call = True
+                        t = asyncio.create_task(_speak_opener(why))
+                        t.add_done_callback(_log_task_exception)
+                        narrate_tasks.append(t)
+
+                    # The phrase is for READING. What gets SPOKEN otherwise is chosen from a
+                    # closed set of pre-rendered clips by action class. Send the class; the
+                    # page decides if anything plays.
                     #
                     # Deliberately NOT gated on `phrase == last_phrase` like the status
                     # line above: a repeated phrase is still a step that happened, and
                     # suppressing its cue would hide real progress. The pacing that stops
                     # her chattering is a timer in the browser, where it can see whether
                     # she is already talking.
-                    try:
-                        await relay_ws.send(json.dumps(
-                            build_cue_envelope(envelope, bot_slug, class_for_tool(name))))
-                    except Exception:
-                        return
+                    if not spoke_this_call:
+                        try:
+                            await relay_ws.send(json.dumps(
+                                build_cue_envelope(envelope, bot_slug, class_for_tool(name))))
+                        except Exception:
+                            return
 
                     # Live TTS of the phrase. OFF by default and kept only as an escape
                     # hatch: measured on a real turn it fired four times in six seconds,
