@@ -877,6 +877,47 @@ def _strip_spoken(buf: str) -> str:
     return out
 
 
+# The spoken block's CONTENTS, markers removed. _strip_spoken deletes them because the
+# spoken summary is normally a restatement of a longer typed reply, and printing both
+# shows the answer twice.
+def _spoken_only(buf: str) -> str:
+    parts: list[str] = []
+    for open_tag, close_tag in (('[SPOKEN]', '[/SPOKEN]'), ('<spoken>', '</spoken>')):
+        pos = 0
+        while True:
+            i = buf.find(open_tag, pos)
+            if i < 0:
+                break
+            i += len(open_tag)
+            j = buf.find(close_tag, i)
+            if j < 0:
+                parts.append(buf[i:])          # still being written
+                break
+            parts.append(buf[i:j])
+            pos = j + len(close_tag)
+    out = ' '.join(p.strip() for p in parts if p.strip())
+    # The closer arrives in fragments too, so trim a dangling "[" or "[/SPOK".
+    for tag in ('[/SPOKEN]', '</spoken>'):
+        for n in range(len(tag) - 1, 0, -1):
+            if out.endswith(tag[:n]):
+                return out[:-n].rstrip()
+    return out
+
+
+# What to put on the wire while she is still writing.
+#
+# When the WHOLE reply is a spoken block — the normal shape for any short answer —
+# stripping it leaves the empty string, the caller's truthiness guard never fires, and
+# not one frame is sent: streaming reply was dead for most turns. Measured 2026-10-29:
+# her text was complete 1.3s into the turn and her face moved at 8.0s, with the page
+# shown nothing in between. Fall back to the spoken words, which are the words she is
+# about to say; the streamed copy is removed when the real bubble lands, so it still
+# cannot print twice.
+def _visible_reply(buf: str) -> str:
+    shown = _strip_spoken(buf)
+    return shown if shown.strip() else _spoken_only(buf)
+
+
 def _find_tool_uses(event) -> list[tuple[str, dict]]:
     """Walk a claude stream-json event for (name, input) of tool_use blocks."""
     uses: list[tuple[str, dict]] = []
@@ -985,7 +1026,7 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                 # unexamined.
                 for piece in _reply_text_deltas(msg.get('event', {}), _text_blocks):
                     _reply_buf.append(piece)
-                    shown = _strip_spoken(''.join(_reply_buf))
+                    shown = _visible_reply(''.join(_reply_buf))
                     if shown and shown != _last_shown[0]:
                         _last_shown[0] = shown
                         try:
