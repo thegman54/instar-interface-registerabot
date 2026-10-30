@@ -1021,6 +1021,18 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                 if msg.get('type') != 'output' or msg.get('conversation_id') != conversation_id:
                     continue
 
+                # A new assistant message starts its own visible text. Without this the
+                # buffer only ever grows: this subscriber is keyed on conversation_id,
+                # not on the turn, so a task still winding down from the previous turn
+                # keeps appending and the page showed the last answer welded to the new
+                # one — "Seven here. Standing by. Huron, Ontario, Michigan, ...".
+                _ev = msg.get('event') or {}
+                if (isinstance(_ev, dict) and _ev.get('type') == 'stream_event'
+                        and ((_ev.get('event') or {}).get('type') == 'message_start')):
+                    _reply_buf.clear()
+                    _text_blocks.clear()
+                    _last_shown[0] = ''
+
                 # Her words, as she writes them. This loop was already open and already
                 # filtering this stream for tool narration; the text was flowing past it
                 # unexamined.
