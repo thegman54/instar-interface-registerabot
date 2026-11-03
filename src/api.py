@@ -94,6 +94,22 @@ NARRATE_MIN_CHARS = int(os.environ.get('REGISTERABOT_NARRATE_MIN_CHARS', '12'))
 # annoying does not apply. Kill switch, not a feature flag.
 SPEAK_OPENER = os.environ.get('REGISTERABOT_SPEAK_OPENER', '1').lower() not in ('0', 'false', 'no')
 
+# SHOULD A NON-ENGLISH PAGE SILENCE HER? Default NO, by the owner's call on 2026-11-03.
+#
+# The argument for muting: the deployed Chatterbox is CHATTERBOX_MODEL=turbo, which
+# accepts a language_id and discards it, so a Spanish reply is read with English
+# pronunciation rather than in a Spanish voice.
+#
+# The argument against, which won: a voice with a bad accent is still a voice, and
+# silence is not an improvement on it. An English speaker reading Spanish out loud is a
+# thing people do and understand. Going mute is the stranger behaviour, and it also
+# takes the FACE with it, since the avatar render is gated on audio.
+#
+# Kept as a flag rather than deleted, because it is the exact gate the multilingual
+# model will want — at that point it stops being "is this English" and becomes "is this
+# locale in get_supported_languages()", which is 23 languages including Hebrew.
+LANG_MUTES_VOICE = os.environ.get('REGISTERABOT_LANG_MUTES_VOICE', '0').lower() in ('1', 'true', 'yes')
+
 # Upper bound the connector waits for a bot turn. The REAL budget is per-profile and
 # enforced by the gatekeeper (which returns within it); this ceiling just has to exceed
 # the largest profile timeout so httpx never throws ReadTimeout before the gatekeeper replies.
@@ -969,10 +985,10 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
     Purely additive: wrapped so it can never disturb the final response. Cancelled by
     the caller once the turn's final is in hand.
 
-    speak_ok=False means no audio will be produced on this turn at all (today: the page
-    is set to a language the English-only voice cannot read). Said ONCE, up front, as
-    'skipped' — the page then marks Voice and Face 'not coming' immediately instead of
-    waiting out a render budget for something that was never going to arrive.
+    speak_ok=False means no audio will be produced on this turn at all. Said ONCE, up
+    front, as 'skipped' — the page then marks Voice and Face 'not coming' immediately
+    instead of waiting out a render budget for something that was never coming. Only
+    LANG_MUTES_VOICE sets it today, and that defaults off.
     """
     admin = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
     ws_url = admin.replace('https://', 'wss://').replace('http://', 'ws://') + f'/ws/terminal/{bot_slug}'
@@ -1372,7 +1388,7 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     # Unset or 'en' both mean she may speak. Any other language means text only, for as
     # long as the voice is English-only.
     turn_locale = locale_of(envelope)
-    speak_ok = turn_locale in ('', 'en')
+    speak_ok = (not LANG_MUTES_VOICE) or turn_locale in ('', 'en')
     assertion = extract_assertion_from_envelope(envelope)
     # Diagnostic: which top-level fields actually arrived, and did the assertion survive
     # the portal -> relay -> here hop. Logs shape only, never the token itself.
@@ -1490,13 +1506,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
             if gk_data.get('response'):
                 text_attachments = [a for a in gk_data.get('attachments', []) if a.get('type') != 'audio']
                 spoken = gk_data.get('spoken', '')
-                # ENGLISH-ONLY VOICE. The deployed Chatterbox is CHATTERBOX_MODEL=turbo,
-                # which accepts a language_id and silently discards it — so a Spanish
-                # reply does not come out in a Spanish voice, it comes out as Spanish
-                # words with English pronunciation. The bot is also told not to mark a
-                # spoken block on these turns; this is the enforcement behind that, and
-                # it is here because the adapter is the single writer of audio.
-                # Dropping `spoken` also drops the face render, which is gated on audio.
+                # Only reached with LANG_MUTES_VOICE on — off by default, see the flag.
+                # Here rather than anywhere else because the adapter is the single writer
+                # of audio, and dropping `spoken` also drops the face render, which is
+                # gated on audio_b64.
                 if not speak_ok and spoken:
                     log.info("voice_suppressed_for_locale", bot=bot_slug, locale=turn_locale)
                     spoken = ''
