@@ -168,6 +168,18 @@ def extract_user_context_from_envelope(envelope: dict) -> dict:
     return uc if isinstance(uc, dict) else {}
 
 
+def locale_of(envelope: dict) -> str:
+    """The page language the visitor chose, as a bare two-letter code ('' if unset).
+
+    The relay validates the shape before stamping it, and this re-checks rather than
+    trusting that: it decides whether she speaks, and it is the only field in
+    user_context a visitor's browser gets to set.
+    """
+    uc = extract_user_context_from_envelope(envelope) or {}
+    loc = str(uc.get('locale') or '').strip().lower()
+    return loc if len(loc) == 2 and loc.isalpha() and loc.isascii() else ''
+
+
 def extract_assertion_from_envelope(envelope: dict) -> str:
     """Pull the signed AI action assertion, if the sender attached one.
 
@@ -950,11 +962,17 @@ def _find_tool_uses(event) -> list[tuple[str, dict]]:
     return uses
 
 
-async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, envelope: dict) -> None:
+async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, envelope: dict,
+                                speak_ok: bool = True) -> None:
     """Subscribe to the gatekeeper's terminal output stream and forward the bot's
     tool-use as 'status' frames to the sender, in parallel with the blocking /process.
     Purely additive: wrapped so it can never disturb the final response. Cancelled by
     the caller once the turn's final is in hand.
+
+    speak_ok=False means no audio will be produced on this turn at all (today: the page
+    is set to a language the English-only voice cannot read). Said ONCE, up front, as
+    'skipped' — the page then marks Voice and Face 'not coming' immediately instead of
+    waiting out a render budget for something that was never going to arrive.
     """
     admin = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
     ws_url = admin.replace('https://', 'wss://').replace('http://', 'ws://') + f'/ws/terminal/{bot_slug}'
@@ -977,7 +995,7 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
     # Narration state. TTS runs OFF the read loop so a slow synth never delays the next
     # status line, but clips are serialised behind one lock so they arrive — and therefore
     # play — in the order the steps actually happened.
-    voice_group = await _get_voice_group(bot_slug) if NARRATE_TOOLS else ''
+    voice_group = await _get_voice_group(bot_slug) if (NARRATE_TOOLS and speak_ok) else ''
     narrate_lock = asyncio.Lock()
     narrate_tasks: list[asyncio.Task] = []
 
@@ -1031,6 +1049,15 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
             await relay_ws.send(json.dumps(
                 build_status_audio_envelope(envelope, bot_slug, line, audio)))
         log.info("spoke_opener", bot=bot_slug, line=line[:60], face=bool(avatar))
+
+    if not speak_ok:
+        _will_speak[0] = False
+        try:
+            await relay_ws.send(json.dumps(build_media_status_envelope(
+                envelope, bot_slug, 'audio', 'skipped',
+                {'will_speak': False, 'reason': 'the voice cannot read this language yet'})))
+        except Exception:
+            return
 
     try:
         async with websockets.connect(ws_url, open_timeout=5) as tws:
@@ -1120,7 +1147,7 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                     # said something. Skipping the cue here also stops the two cutting each
                     # other off, since the page swaps the video source rather than queueing.
                     spoke_this_call = False
-                    if SPEAK_OPENER and why and not spoke_opener[0]:
+                    if SPEAK_OPENER and speak_ok and why and not spoke_opener[0]:
                         spoke_opener[0] = True
                         spoke_this_call = True
                         t = asyncio.create_task(_speak_opener(why))
@@ -1136,7 +1163,9 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                     # suppressing its cue would hide real progress. The pacing that stops
                     # her chattering is a timer in the browser, where it can see whether
                     # she is already talking.
-                    if not spoke_this_call:
+                    # Cues are pre-rendered clips of her saying English filler, so they
+                    # are speech too and go quiet with everything else.
+                    if not spoke_this_call and speak_ok:
                         try:
                             await relay_ws.send(json.dumps(
                                 build_cue_envelope(envelope, bot_slug, class_for_tool(name))))
@@ -1340,6 +1369,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     session_id = envelope.get('session_id', '')
     messages, source_info = extract_messages_from_envelope(envelope)
     user_context = extract_user_context_from_envelope(envelope)
+    # Unset or 'en' both mean she may speak. Any other language means text only, for as
+    # long as the voice is English-only.
+    turn_locale = locale_of(envelope)
+    speak_ok = turn_locale in ('', 'en')
     assertion = extract_assertion_from_envelope(envelope)
     # Diagnostic: which top-level fields actually arrived, and did the assertion survive
     # the portal -> relay -> here hop. Logs shape only, never the token itself.
@@ -1421,7 +1454,7 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
             # Forward the bot's tool-use as 'status' progress frames while the turn
             # runs. Additive side-channel — the final response below is unaffected.
             status_task = asyncio.create_task(
-                _stream_status_frames(bot_slug, conversation_id, ws, envelope)
+                _stream_status_frames(bot_slug, conversation_id, ws, envelope, speak_ok)
             )
             try:
                 gk_response = await client.post(
@@ -1457,6 +1490,16 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
             if gk_data.get('response'):
                 text_attachments = [a for a in gk_data.get('attachments', []) if a.get('type') != 'audio']
                 spoken = gk_data.get('spoken', '')
+                # ENGLISH-ONLY VOICE. The deployed Chatterbox is CHATTERBOX_MODEL=turbo,
+                # which accepts a language_id and silently discards it — so a Spanish
+                # reply does not come out in a Spanish voice, it comes out as Spanish
+                # words with English pronunciation. The bot is also told not to mark a
+                # spoken block on these turns; this is the enforcement behind that, and
+                # it is here because the adapter is the single writer of audio.
+                # Dropping `spoken` also drops the face render, which is gated on audio.
+                if not speak_ok and spoken:
+                    log.info("voice_suppressed_for_locale", bot=bot_slug, locale=turn_locale)
+                    spoken = ''
                 voice_group_id = gk_data.get('voice_group_id', '')
 
                 # Is a talking-head avatar enabled? If so, the rendered video carries the
