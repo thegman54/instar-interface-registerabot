@@ -353,7 +353,7 @@ _MEDIA_STATUS_TEXT = {
 
 
 def build_media_status_envelope(original_envelope: dict, bot_slug: str,
-                                stage: str, state: str) -> dict:
+                                stage: str, state: str, extra: dict = None) -> dict:
     """Progress for the media that arrives AFTER the text — TTS, then the avatar render.
 
     The existing 'status' frame can't carry this: it narrates tool use during the turn and
@@ -374,16 +374,23 @@ def build_media_status_envelope(original_envelope: dict, bot_slug: str,
         'encrypted': False,
         'payload': json.dumps({
             'stage': stage,                 # 'audio' | 'video'
-            'state': state,                 # 'start' | 'done'
+            # 'failed' is NOT a variety of 'done'. Until it existed, a render that died
+            # and a render that worked sent the same frame and the page cleared the same
+            # spinner, so the only visible difference between them was that no face ever
+            # appeared — nine seconds later, with nothing on screen saying why.
+            'state': state,                 # 'start' | 'done' | 'failed' | 'expected' | 'skipped'
             'text': _MEDIA_STATUS_TEXT.get(stage, stage),
+            **(extra or {}),
         }),
     }
 
 
-async def _send_media_status(ws, envelope: dict, bot_slug: str, stage: str, state: str) -> None:
+async def _send_media_status(ws, envelope: dict, bot_slug: str, stage: str, state: str,
+                             **extra) -> None:
     """Fire-and-forget progress ping. Never let telling someone we're working break the work."""
     try:
-        await ws.send(json.dumps(build_media_status_envelope(envelope, bot_slug, stage, state)))
+        await ws.send(json.dumps(
+            build_media_status_envelope(envelope, bot_slug, stage, state, extra or None)))
     except Exception as e:
         log.debug("media_status_send_failed", error=str(e), stage=stage, state=state, bot=bot_slug)
 
@@ -678,6 +685,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
     turn_id = f"{envelope.get('session_id', '')}:{int(time.time() * 1000)}"
     wav = base64.b64decode(audio_b64)
     await _send_media_status(ws, envelope, bot_slug, 'video', 'start')
+    rendered, why_not = False, 'the renderer returned no frames'
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
             if not FACE_CHUNKED:
@@ -752,14 +760,20 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                     log.info("video_frame_sent", bot=bot_slug, seq=chunk.get('seq'),
                              final=bool(chunk.get('final')), frames=chunk.get('frames'),
                              render_secs=chunk.get('elapsed'))
+            rendered = sent > 0
             if not sent:
                 log.debug("video_render_empty", bot=bot_slug)
     except Exception as e:
+        why_not = f"{type(e).__name__}: {e}".rstrip(': ').strip()
         log.debug("video_render_error", error=str(e), bot=bot_slug)
     finally:
-        # Clear on every exit path, including failure — a stuck "rendering her face" reads
-        # as a hang, which is worse than never having shown it.
-        await _send_media_status(ws, envelope, bot_slug, 'video', 'done')
+        # Clear on every exit path — a stuck "rendering her face" reads as a hang, which is
+        # worse than never having shown it. But say WHICH exit: see 'failed' above.
+        if rendered:
+            await _send_media_status(ws, envelope, bot_slug, 'video', 'done')
+        else:
+            await _send_media_status(ws, envelope, bot_slug, 'video', 'failed',
+                                     reason=why_not[:200])
 
 
 # Friendly progress wording per tool (tweak freely). Falls back to a cleaned name.
@@ -953,6 +967,13 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
     _text_blocks: set = set()
     _reply_buf: list = []
     _last_shown = ['']
+    # WILL SHE SPEAK? The single most useful thing the page can be told, and it was never
+    # on the wire. She marks spoken words inline with [SPOKEN]; this loop already finds
+    # that marker, to keep it off the screen. So the answer is known the instant the
+    # opening tag streams past — seconds before any audio exists — and 'no' is knowable
+    # at the end of a stream that never contained one. Without it the visitor waits out
+    # the whole render budget to discover there was nothing coming.
+    _will_speak = [None]        # None = not yet known, True/False = told the page
     # Narration state. TTS runs OFF the read loop so a slow synth never delays the next
     # status line, but clips are serialised behind one lock so they arrive — and therefore
     # play — in the order the steps actually happened.
@@ -1032,12 +1053,23 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                     _reply_buf.clear()
                     _text_blocks.clear()
                     _last_shown[0] = ''
+                    _will_speak[0] = None
 
                 # Her words, as she writes them. This loop was already open and already
                 # filtering this stream for tool narration; the text was flowing past it
                 # unexamined.
                 for piece in _reply_text_deltas(msg.get('event', {}), _text_blocks):
                     _reply_buf.append(piece)
+                    if _will_speak[0] is None:
+                        whole = ''.join(_reply_buf)
+                        if '[SPOKEN]' in whole or '<spoken>' in whole:
+                            _will_speak[0] = True
+                            try:
+                                await relay_ws.send(json.dumps(build_media_status_envelope(
+                                    envelope, bot_slug, 'audio', 'expected',
+                                    {'will_speak': True})))
+                            except Exception:
+                                return
                     shown = _visible_reply(''.join(_reply_buf))
                     if shown and shown != _last_shown[0]:
                         _last_shown[0] = shown
@@ -1046,6 +1078,19 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
                                 build_reply_delta_envelope(envelope, bot_slug, shown)))
                         except Exception:
                             return
+
+                # The stream ended and no spoken block ever appeared: nothing is coming.
+                # Saying 'no' is worth as much as saying 'yes' — it is what lets the page
+                # stop showing a wait for a voice that does not exist.
+                if (isinstance(_ev, dict) and _ev.get('type') == 'stream_event'
+                        and ((_ev.get('event') or {}).get('type') == 'message_stop')
+                        and _will_speak[0] is None and _reply_buf):
+                    _will_speak[0] = False
+                    try:
+                        await relay_ws.send(json.dumps(build_media_status_envelope(
+                            envelope, bot_slug, 'audio', 'skipped', {'will_speak': False})))
+                    except Exception:
+                        return
 
                 for name, tool_input in _find_tool_uses(msg.get('event', {})):
                     # Prefer the bot's own stated intent ('why', <=15 words) — real
@@ -1453,7 +1498,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                     if spoken and voice_group_id:
                         await _send_media_status(ws, envelope, bot_slug, 'audio', 'start')
                         audio_b64 = await _generate_tts(spoken, voice_group_id)
-                        await _send_media_status(ws, envelope, bot_slug, 'audio', 'done')
+                        await _send_media_status(
+                            ws, envelope, bot_slug, 'audio',
+                            'done' if audio_b64 else 'failed',
+                            **({} if audio_b64 else {'reason': 'the voice service returned no audio'}))
                 else:
                     if spoken and voice_group_id:
                         audio_b64 = await _generate_tts(spoken, voice_group_id)
