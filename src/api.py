@@ -752,11 +752,16 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                     )
                 if resp.status_code != 200:
                     log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+                    why_not = f"the renderer answered {resp.status_code}"
                     return
                 await ws.send(json.dumps(build_video_envelope(
                     envelope, bot_slug, base64.b64encode(resp.content).decode(),
                     turn_id=turn_id, seq=0, final=True)))
                 log.info("video_frame_sent", bytes=len(resp.content), bot=bot_slug)
+                # The clip is out. Say so, or `finally` reports the default — which is
+                # how every successful single-clip render came to light up the Video
+                # lane red while the face played perfectly well underneath it.
+                rendered = True
                 return
 
             # Chunked: forward each clip the moment it lands rather than waiting for the
@@ -769,6 +774,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
             ) as resp:
                 if resp.status_code != 200:
                     log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+                    why_not = f"the renderer answered {resp.status_code}"
                     return
                 async for line in resp.aiter_lines():
                     if not line.strip():
