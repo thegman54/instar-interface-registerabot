@@ -737,7 +737,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                         log.info("video_cache", result=resp.headers.get('X-Cache', '?'),
                                  bot=bot_slug)
                     else:
-                        log.debug("video_cache_route_failed", status=resp.status_code,
+                        log.info("video_cache_route_failed", status=resp.status_code,
                                   bot=bot_slug)
                         resp = None
                 except Exception as e:
@@ -751,7 +751,8 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                         data={'avatar_id': avatar_id},
                     )
                 if resp.status_code != 200:
-                    log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+                    log.warning("video_render_failed", status=resp.status_code,
+                                body=resp.text[:200], bot=bot_slug)
                     why_not = f"the renderer answered {resp.status_code}"
                     return
                 await ws.send(json.dumps(build_video_envelope(
@@ -773,7 +774,8 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                 data={'avatar_id': avatar_id},
             ) as resp:
                 if resp.status_code != 200:
-                    log.debug("video_render_failed", status=resp.status_code, bot=bot_slug)
+                    log.warning("video_render_failed", status=resp.status_code,
+                                body=resp.text[:200], bot=bot_slug)
                     why_not = f"the renderer answered {resp.status_code}"
                     return
                 async for line in resp.aiter_lines():
