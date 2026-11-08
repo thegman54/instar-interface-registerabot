@@ -1400,7 +1400,13 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     assertion = extract_assertion_from_envelope(envelope)
     # Diagnostic: which top-level fields actually arrived, and did the assertion survive
     # the portal -> relay -> here hop. Logs shape only, never the token itself.
+    # user_context KEYS, never values. It is the only channel on which a person's identity
+    # could already be arriving, and until now nothing recorded whether it does — the blob is
+    # forwarded verbatim to the gatekeeper and into the prompt, and read by nobody else. Keys
+    # alone answer "is the chat-link subject already here" without putting a name, an email or
+    # an address into a log.
     log.info("envelope_fields", keys=sorted(envelope.keys()),
+             uc_keys=sorted((user_context or {}).keys()),
              has_assertion=bool(assertion), assertion_len=len(assertion or ""))
 
     if not messages:
