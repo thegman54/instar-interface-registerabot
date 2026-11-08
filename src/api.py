@@ -219,6 +219,33 @@ def extract_assertion_from_envelope(envelope: dict) -> str:
     return a if isinstance(a, str) else ''
 
 
+def extract_client_from_envelope(envelope: dict) -> dict:
+    """Pull the relay's stamp of where the browser connected from.
+
+    Same road as the assertion above, and for the same reason: user_context is forwarded
+    into the bot's prompt, so anything there can be quoted back, summarised, or talked
+    out of the model. An address an operator reads off an approval card has to arrive on
+    a channel the bot never touches.
+
+    The relay stamps this UNCONDITIONALLY on every visitor envelope, overwriting whatever
+    the page claimed — including with an empty address when Cloudflare gave it none. So a
+    `client` here is the relay's word or it is blank; it is never the visitor's.
+
+    It is evidence, never a gate input. An address is mobile and partly forgeable.
+    """
+    raw = envelope.get('client')
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    ip = raw.get('ip')
+    country = raw.get('country')
+    if isinstance(ip, str) and ip:
+        out['ip'] = ip[:45]
+    if isinstance(country, str) and country:
+        out['country'] = country[:2]
+    return out
+
+
 def build_response_envelope(
     original_envelope: dict,
     bot_slug: str,
@@ -1398,6 +1425,7 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
     turn_locale = locale_of(envelope)
     speak_ok = (not LANG_MUTES_VOICE) or turn_locale in ('', 'en')
     assertion = extract_assertion_from_envelope(envelope)
+    client_info = extract_client_from_envelope(envelope)
     # Diagnostic: which top-level fields actually arrived, and did the assertion survive
     # the portal -> relay -> here hop. Logs shape only, never the token itself.
     # user_context KEYS, never values. It is the only channel on which a person's identity
@@ -1478,6 +1506,10 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                 # Session-bound credential, never merged into user_context (see
                 # extract_assertion_from_envelope) so it stays out of the bot's prompt.
                 gk_body['assertion'] = assertion
+            if client_info:
+                # Ditto: its own top-level key, bound to the session by the gatekeeper
+                # and served back from /session-info. Never in user_context.
+                gk_body['client'] = client_info
             if attachments:
                 gk_body['attachments'] = attachments
 
