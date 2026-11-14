@@ -730,10 +730,18 @@ async def _get_face_config(voice_group_id: str) -> dict:
 FACE_CHUNKED = os.environ.get('FACE_CHUNKED', '').lower() in ('1', 'true', 'yes')
 
 
-async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: str, avatar_id: str) -> None:
+async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: str,
+                                 avatar_id: str, text: str = '') -> None:
     """Decoupled talking-head avatar: render the turn's audio through the avatar and send
     'video' frame(s) carrying the lip-synced clip (with audio baked in).
-    Fire-and-forget; any failure is swallowed so it never affects the chat."""
+    Fire-and-forget; any failure is swallowed so it never affects the chat.
+
+    `text` IS THE SPOKEN REPLY, and it must be passed in. It was previously read
+    as envelope.get('text') - the INBOUND envelope, which carries the user's turn
+    under 'messages' and has no 'text' key at all, so the value was always ''.
+    FLOAT ignores it and nothing looked wrong; a cel avatar drives its mouth from
+    it, so Peter rendered a rest pose on every single turn while every other part
+    of the chain was correct."""
     import base64
     face_url = os.environ.get('FACE_RENDERER_URL', 'http://instar-face-renderer:8088')
     admin_url = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
@@ -758,7 +766,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                     resp = await client.post(
                         f"{admin_url}/api/render/cached",
                         files={'audio': ('speech.wav', wav, 'audio/wav')},
-                        data={'avatar_id': avatar_id, 'text': envelope.get('text') or ''},
+                        data={'avatar_id': avatar_id, 'text': text or ''},
                     )
                     if resp.status_code == 200:
                         log.info("video_cache", result=resp.headers.get('X-Cache', '?'),
@@ -779,7 +787,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                         # fallback did not, so a cel avatar lost its lip sync
                         # precisely when the cache was unavailable.
                         data={'avatar_id': avatar_id,
-                              'text': envelope.get('text') or ''},
+                              'text': text or ''},
                     )
                 if resp.status_code != 200:
                     log.warning("video_render_failed", status=resp.status_code,
@@ -803,7 +811,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                 'POST', f"{face_url}/render/chunked",
                 files={'audio': ('speech.wav', wav, 'audio/mpeg')},
                 data={'avatar_id': avatar_id,
-                      'text': envelope.get('text') or ''},
+                      'text': text or ''},
             ) as resp:
                 if resp.status_code != 200:
                     log.warning("video_render_failed", status=resp.status_code,
@@ -1100,7 +1108,7 @@ async def _stream_status_frames(bot_slug: str, conversation_id: str, relay_ws, e
         if avatar:
             # Same cached render route as a reply, so a repeated opener — and openers
             # repeat constantly — costs 28ms instead of a 2.4s render.
-            await _render_and_send_video(relay_ws, envelope, bot_slug, audio, avatar)
+            await _render_and_send_video(relay_ws, envelope, bot_slug, audio, avatar, line)
         else:
             await relay_ws.send(json.dumps(
                 build_status_audio_envelope(envelope, bot_slug, line, audio)))
@@ -1634,7 +1642,8 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                         )
                     if audio_b64:
                         asyncio.create_task(
-                            _render_and_send_video(ws, envelope, bot_slug, audio_b64, avatar_id)
+                            _render_and_send_video(ws, envelope, bot_slug, audio_b64,
+                                                   avatar_id, spoken)
                         )
 
                 return
