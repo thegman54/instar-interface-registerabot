@@ -119,10 +119,15 @@ class CueLibrary:
         return r.content
 
     async def _render(self, client: httpx.AsyncClient, face_url: str,
-                      avatar_id: str, wav: bytes) -> bytes | None:
+                      avatar_id: str, wav: bytes, text: str = '') -> bytes | None:
+        # SEND THE TEXT. FLOAT reads mouth shapes off the waveform and ignores
+        # this, but a cel avatar is rendered by the sprite engine, which drives
+        # its mouth from a phoneme timeline built from the words. Without it the
+        # renderer falls back to a rest pose and the face never speaks - and the
+        # phrase is right here in the loop, so there is nothing to look up.
         r = await client.post(f"{face_url}/render",
                               files={'audio': ('cue.wav', wav, 'audio/wav')},
-                              data={'avatar_id': avatar_id})
+                              data={'avatar_id': avatar_id, 'text': text})
         if r.status_code != 200:
             log.warning("cue_render_failed", status=r.status_code, avatar=avatar_id)
             return None
@@ -153,7 +158,7 @@ class CueLibrary:
                         wav = await self._tts(client, admin, voice_group_id, line)
                         if not wav:
                             continue
-                        mp4 = await self._render(client, face_url, avatar_id, wav)
+                        mp4 = await self._render(client, face_url, avatar_id, wav, line)
                         if not mp4:
                             continue
                         p.parent.mkdir(parents=True, exist_ok=True)

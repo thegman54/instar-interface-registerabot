@@ -775,7 +775,11 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                     resp = await client.post(
                         f"{face_url}/render",
                         files={'audio': ('speech.wav', wav, 'audio/mpeg')},
-                        data={'avatar_id': avatar_id},
+                        # The cached route above already sends the text; this
+                        # fallback did not, so a cel avatar lost its lip sync
+                        # precisely when the cache was unavailable.
+                        data={'avatar_id': avatar_id,
+                              'text': envelope.get('text') or ''},
                     )
                 if resp.status_code != 200:
                     log.warning("video_render_failed", status=resp.status_code,
@@ -798,7 +802,8 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
             async with client.stream(
                 'POST', f"{face_url}/render/chunked",
                 files={'audio': ('speech.wav', wav, 'audio/mpeg')},
-                data={'avatar_id': avatar_id},
+                data={'avatar_id': avatar_id,
+                      'text': envelope.get('text') or ''},
             ) as resp:
                 if resp.status_code != 200:
                     log.warning("video_render_failed", status=resp.status_code,
