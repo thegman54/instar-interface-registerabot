@@ -1461,6 +1461,7 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
         bot=bot_slug,
         message_count=len(messages),
     )
+    _note_page_session(bot_slug, envelope)
 
     # A FRESH PAGE: forget what this conversation was sent, and push the clips NOW.
     #
@@ -1573,6 +1574,8 @@ async def handle_message(envelope: dict, ws, bot_slug: str) -> None:
                     log.info("voice_suppressed_for_locale", bot=bot_slug, locale=turn_locale)
                     spoken = ''
                 voice_group_id = gk_data.get('voice_group_id', '')
+                _note_page_session(bot_slug, envelope, voice_group_id=voice_group_id,
+                                   gk_session_id=gk_data.get('session_id', ''))
 
                 # Is a talking-head avatar enabled? If so, the rendered video carries the
                 # audio (baked in) — so we must NOT also send standalone audio, or it plays
@@ -1750,6 +1753,81 @@ async def _send_audio_frame(ws, original_envelope: dict, bot_slug: str, audio_b6
         log.warning("audio_frame_ws_closed", bot=bot_slug)
     except Exception as e:
         log.warning("audio_frame_error", error=str(e), bot=bot_slug)
+
+
+# THE PAGE A BOT CAN SPEAK TO UNASKED. Every send path answers an envelope the visitor sent,
+# so work finished on another thread (a fleet ticket, a gate replay) had no way onto the page:
+# 2026-11-16, a unit sat held for approval while the page stayed idle. The last envelope per
+# slug is that page's address; push() replies on it after the turn is over.
+# Kept on the state volume: a bridge restart must not leave the page unreachable until the
+# visitor happens to type again.
+_PAGE_SESSIONS_PATH = os.environ.get(
+    'PAGE_SESSIONS_CACHE',
+    '/state/page_sessions.json' if os.path.isdir('/state') else '/tmp/page_sessions.json')
+_page_sessions: dict[str, dict] = {}
+try:
+    with open(_PAGE_SESSIONS_PATH) as _fh:
+        _page_sessions = json.load(_fh)
+except Exception:                                                    # noqa: BLE001
+    pass
+
+
+def _note_page_session(bot_slug: str, envelope: dict, voice_group_id: str = '',
+                       gk_session_id: str = '') -> None:
+    s = _page_sessions.setdefault(bot_slug, {})
+    if envelope.get('session_id') != s.get('envelope', {}).get('session_id'):
+        s.pop('gk_session_id', None)
+    # Routing only: the visitor's words are not kept.
+    s['envelope'] = {k: envelope[k] for k in ('v', 'session_id', 'from', 'to') if k in envelope}
+    s['at'] = time.time()
+    if voice_group_id:
+        s['voice_group_id'] = voice_group_id
+    if gk_session_id:
+        s['gk_session_id'] = gk_session_id
+    try:
+        with open(_PAGE_SESSIONS_PATH, 'w') as fh:
+            json.dump(_page_sessions, fh)
+    except Exception as e:                                           # noqa: BLE001
+        log.debug("page_sessions_save_failed", error=str(e))
+
+
+async def push_to_page(bot_slug: str, text: str, spoken: str = '') -> dict:
+    """Say `text` on the slug's most recent page session, with her voice when `spoken` is set.
+
+    Text first, then audio (or a face render when the avatar is on), the same order a turn
+    uses. The line is recorded in the gatekeeper history of that conversation so the page's
+    transcript holds it after a reload."""
+    s = _page_sessions.get(bot_slug) or {}
+    envelope = s.get('envelope')
+    if not envelope:
+        return {'delivered': False, 'reason': f"no page has talked to '{bot_slug}' since the bridge started"}
+    ws = _live_host_ws()
+    if ws is None:
+        return {'delivered': False, 'reason': 'no live relay socket'}
+    voice_group_id = s.get('voice_group_id', '')
+    face_cfg = _face_cfg_by_slug.get(bot_slug) or {}
+    face_on = bool(face_cfg.get('face_avatar_id'))
+    audio_b64 = await _generate_tts(spoken, voice_group_id) if (spoken and voice_group_id) else ''
+    await send_response(ws, envelope, bot_slug, text, spoken,
+                        audio_base64='' if face_on else audio_b64)
+    if audio_b64:
+        if face_on:
+            asyncio.create_task(_render_and_send_video(
+                ws, envelope, bot_slug, audio_b64, face_cfg['face_avatar_id'], spoken))
+        else:
+            await _send_audio_frame(ws, envelope, bot_slug, audio_b64)
+    if s.get('gk_session_id'):
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(f"{GATEKEEPER_URL}/record-response",
+                                  json={'session_id': s['gk_session_id'], 'response': text},
+                                  timeout=10.0)
+        except Exception as e:                                       # noqa: BLE001
+            log.warning("push_record_failed", bot=bot_slug, error=str(e)[:200])
+    log.info("page_push", bot=bot_slug, session=envelope.get('session_id', ''),
+             spoken=bool(audio_b64), length=len(text))
+    return {'delivered': True, 'session_id': envelope.get('session_id', ''),
+            'spoken': bool(audio_b64), 'page_seen_s_ago': int(time.time() - s.get('at', 0))}
 
 
 def _live_host_ws():
@@ -2402,6 +2480,20 @@ async def disconnect_slug(slug: str):
         return {"status": "not_connected", "slug": slug}
 
     return {"status": "disconnected", "slug": slug}
+
+
+@app.post("/slugs/{slug}/push")
+async def push_slug(slug: str, request: dict | None = None):
+    """Say something on the slug's open page without being asked.
+
+    Body: {"text": "...", "spoken": "..." (optional, voiced)}
+    Called by the fleet when something lands in the Inbox. 409 when no page is listening."""
+    request = request or {}
+    text = (request.get('text') or '').strip()
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    result = await push_to_page(slug, text, (request.get('spoken') or '').strip())
+    return JSONResponse(result, status_code=200 if result['delivered'] else 409)
 
 
 @app.get("/slugs")
