@@ -2172,7 +2172,18 @@ class HostConnection:
                     # A new socket confirms NOTHING until the relay ACKs the re-attach.
                     self.confirmed.clear()
                     if self.attached:  # re-attach after a reconnect
-                        await self._send({'type': 'attach', 'slugs': sorted(self.attached)})
+                        # DETACH FIRST, THEN ATTACH (deficiency #43). After a 1006 drop the
+                        # relay re-pointed the slugs at the new socket and ACKed the attach,
+                        # yet delivered no visitor message for 23 minutes (2026-11-17
+                        # 19:37-20:00), and the same on 11-16 twice. Each time a container
+                        # restart fixed it, and the one thing a restart does that this
+                        # reconnect did not is the gatekeeper's explicit detach -> attach per
+                        # slug. So the reconnect now does that cycle itself.
+                        slugs = sorted(self.attached)
+                        await self._send({'type': 'detach', 'slugs': slugs})
+                        await self._send({'type': 'attach', 'slugs': slugs})
+                        log.info("host_rebind", slugs=slugs,
+                                 note="detach+attach after reconnect (#43)")
                     log.info("host_connected", serving=len(self.attached))
                     if self._ping_task is None or self._ping_task.done():
                         self._ping_task = asyncio.create_task(self._ping_loop())
