@@ -1792,7 +1792,7 @@ def _note_page_session(bot_slug: str, envelope: dict, voice_group_id: str = '',
 
 
 async def push_to_page(bot_slug: str, text: str, spoken: str = '',
-                       sender: str = '', sender_name: str = '') -> dict:
+                       sender: str = '', sender_name: str = '', sender_voice: str = '') -> dict:
     """Say `text` on the slug's most recent page session, with her voice when `spoken` is set.
 
     Text first, then audio (or a face render when the avatar is on), the same order a turn
@@ -1817,7 +1817,10 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
     face_cfg = _face_cfg_by_slug.get(bot_slug) or {}
     face_on = bool(face_cfg.get('face_avatar_id'))
     if sender:
-        voice_group_id = (await _get_voice_group(sender)) or voice_group_id
+        # The caller's voice group first: /api/profiles/<slug>/voice answers the PERSONALITY
+        # skill's voice when there is one, which for the coordinator is "Forge" (Alex's own
+        # voice), not the profile's "Peter Griffin" (2026-11-18, Alex heard himself).
+        voice_group_id = sender_voice or (await _get_voice_group(sender)) or voice_group_id
         face_on = False
         label = sender_name or sender
         text = f"{label}: {text}"
@@ -2512,8 +2515,11 @@ async def push_slug(slug: str, request: dict | None = None):
     sender = (request.get('from') or '').strip()
     if sender and not re.fullmatch(r"[a-z0-9_]{1,64}", sender):
         return JSONResponse({"error": "from must be a profile slug"}, status_code=400)
+    voice = (request.get('from_voice') or '').strip()
+    if voice and not re.fullmatch(r"[0-9a-f-]{36}", voice):
+        return JSONResponse({"error": "from_voice must be a voice group id"}, status_code=400)
     result = await push_to_page(slug, text, (request.get('spoken') or '').strip(),
-                                sender, (request.get('from_name') or '').strip()[:40])
+                                sender, (request.get('from_name') or '').strip()[:40], voice)
     return JSONResponse(result, status_code=200 if result['delivered'] else 409)
 
 
