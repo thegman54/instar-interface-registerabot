@@ -377,7 +377,8 @@ async def _get_voice_group(bot_slug: str) -> str:
 
 
 def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: str,
-                         turn_id: str = '', seq: int = 0, final: bool = True) -> dict:
+                         turn_id: str = '', seq: int = 0, final: bool = True,
+                         guest: dict | None = None) -> dict:
     """A talking-head video frame (MP4) routed back to the sender. Optional/additive —
     clients without a <VideoAvatar> ignore it. Arrives well after text (render latency).
 
@@ -396,8 +397,13 @@ def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: s
         'from': {'kind': 'bot', 'slug': bot_slug},
         'to': original_envelope.get('from', {}),
         'encrypted': False,
+        # `guest` ({slug, name}): ANOTHER bot's face speaking on this page. The page plays it
+        # in its own tile beside her head and never in her head (relay chat-surface.ts
+        # playGuestClip). A page without that code plays it in her head, which is wrong but
+        # audible, and the line is labelled with the guest's name either way.
         'payload': json.dumps({'format': 'mp4', 'base64': video_base64,
-                               'turn_id': turn_id, 'seq': seq, 'final': final}),
+                               'turn_id': turn_id, 'seq': seq, 'final': final,
+                               **({'guest': guest} if guest else {})}),
     }
 
 
@@ -731,7 +737,8 @@ FACE_CHUNKED = os.environ.get('FACE_CHUNKED', '').lower() in ('1', 'true', 'yes'
 
 
 async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: str,
-                                 avatar_id: str, text: str = '') -> None:
+                                 avatar_id: str, text: str = '',
+                                 guest: dict | None = None) -> None:
     """Decoupled talking-head avatar: render the turn's audio through the avatar and send
     'video' frame(s) carrying the lip-synced clip (with audio baked in).
     Fire-and-forget; any failure is swallowed so it never affects the chat.
@@ -796,7 +803,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                     return
                 await ws.send(json.dumps(build_video_envelope(
                     envelope, bot_slug, base64.b64encode(resp.content).decode(),
-                    turn_id=turn_id, seq=0, final=True)))
+                    turn_id=turn_id, seq=0, final=True, guest=guest)))
                 log.info("video_frame_sent", bytes=len(resp.content), bot=bot_slug)
                 # The clip is out. Say so, or `finally` reports the default — which is
                 # how every successful single-clip render came to light up the Video
@@ -831,7 +838,7 @@ async def _render_and_send_video(ws, envelope: dict, bot_slug: str, audio_b64: s
                     await ws.send(json.dumps(build_video_envelope(
                         envelope, bot_slug, chunk['base64'],
                         turn_id=turn_id, seq=chunk.get('seq', sent),
-                        final=bool(chunk.get('final')))))
+                        final=bool(chunk.get('final')), guest=guest)))
                     sent += 1
                     log.info("video_frame_sent", bot=bot_slug, seq=chunk.get('seq'),
                              final=bool(chunk.get('final')), frames=chunk.get('frames'),
@@ -1792,7 +1799,8 @@ def _note_page_session(bot_slug: str, envelope: dict, voice_group_id: str = '',
 
 
 async def push_to_page(bot_slug: str, text: str, spoken: str = '',
-                       sender: str = '', sender_name: str = '', sender_voice: str = '') -> dict:
+                       sender: str = '', sender_name: str = '', sender_voice: str = '',
+                       sender_face: str = '') -> dict:
     """Say `text` on the slug's most recent page session, with her voice when `spoken` is set.
 
     Text first, then audio (or a face render when the avatar is on), the same order a turn
@@ -1804,8 +1812,13 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
     caller stamps it from its own records; this route is internal (the fleet's announcer), never
     reachable from a page. The line is labelled with `sender_name` and spoken in the SENDER's
     voice, as audio only: the page's face belongs to the page's bot, and lip-syncing it to someone
-    else's voice would say the opposite of what the label says. The sender's own face is the guest
-    tile, which needs the page code (relay) and is not built yet."""
+    else's voice would say the opposite of what the label says.
+
+    THE GUEST TILE (Part 3). With `sender_face` (the sender's face avatar id) the clip is
+    rendered with the SENDER's face and sent as a video frame marked `guest`; the page plays it
+    in its own labelled circle beside her head, which comes in for the clip and goes when it
+    ends (relay chat-surface.ts playGuestClip). Without it, the sender is audio only."""
+    guest = None
     s = _page_sessions.get(bot_slug) or {}
     envelope = s.get('envelope')
     if not envelope:
@@ -1821,8 +1834,10 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
         # skill's voice when there is one, which for the coordinator is "Forge" (Alex's own
         # voice), not the profile's "Peter Griffin" (2026-11-18, Alex heard himself).
         voice_group_id = sender_voice or (await _get_voice_group(sender)) or voice_group_id
-        face_on = False
         label = sender_name or sender
+        face_on = bool(sender_face)
+        face_cfg = {'face_avatar_id': sender_face} if sender_face else {}
+        guest = {'slug': sender, 'name': label} if sender_face else None
         text = f"{label}: {text}"
     audio_b64 = await _generate_tts(spoken, voice_group_id) if (spoken and voice_group_id) else ''
     await send_response(ws, envelope, bot_slug, text, spoken,
@@ -1830,7 +1845,8 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
     if audio_b64:
         if face_on:
             asyncio.create_task(_render_and_send_video(
-                ws, envelope, bot_slug, audio_b64, face_cfg['face_avatar_id'], spoken))
+                ws, envelope, bot_slug, audio_b64, face_cfg['face_avatar_id'], spoken,
+                guest=guest))
         else:
             await _send_audio_frame(ws, envelope, bot_slug, audio_b64)
     if s.get('gk_session_id'):
@@ -2505,7 +2521,8 @@ async def push_slug(slug: str, request: dict | None = None):
     """Say something on the slug's open page without being asked.
 
     Body: {"text": "...", "spoken": "..." (optional, voiced),
-           "from": "<profile slug>" (optional), "from_name": "<label>" (optional)}
+           "from": "<profile slug>" (optional), "from_name": "<label>" (optional),
+           "from_voice": "<voice group id>" (optional), "from_face": "<face avatar id>" (optional)}
     Called by the fleet when something lands in the Inbox. 409 when no page is listening.
     `from` makes another profile the speaker (its voice, labelled, audio only); see push_to_page."""
     request = request or {}
@@ -2518,8 +2535,12 @@ async def push_slug(slug: str, request: dict | None = None):
     voice = (request.get('from_voice') or '').strip()
     if voice and not re.fullmatch(r"[0-9a-f-]{36}", voice):
         return JSONResponse({"error": "from_voice must be a voice group id"}, status_code=400)
+    face = (request.get('from_face') or '').strip()
+    if face and not re.fullmatch(r"[a-z0-9_-]{1,64}", face):
+        return JSONResponse({"error": "from_face must be a face avatar id"}, status_code=400)
     result = await push_to_page(slug, text, (request.get('spoken') or '').strip(),
-                                sender, (request.get('from_name') or '').strip()[:40], voice)
+                                sender, (request.get('from_name') or '').strip()[:40], voice,
+                                face if sender else '')
     return JSONResponse(result, status_code=200 if result['delivered'] else 409)
 
 
