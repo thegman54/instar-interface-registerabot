@@ -1826,6 +1826,16 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
     ws = _live_host_ws()
     if ws is None:
         return {'delivered': False, 'reason': 'no live relay socket'}
+    # A WRITE TO THE SOCKET IS NOT A DELIVERY. Seconds after a restart the socket is up but the
+    # relay has not re-attached the slug yet, and it answers the frames `not_attached` - after
+    # this function has already said delivered, so the announcer marked the item told when
+    # nobody heard it (deficiency #65, 2026-11-18 01:15). Refuse until the relay has confirmed
+    # this slug on current evidence, the same test /slugs reports as relay_confirmed; the
+    # announcer retries a refused push on its next tick.
+    host = getattr(connection_manager, "_host", None)
+    if host is not None and not (host.routing_fresh() and bot_slug in host.confirmed):
+        return {'delivered': False,
+                'reason': f"the relay has not confirmed '{bot_slug}' yet (reconnecting)"}
     voice_group_id = s.get('voice_group_id', '')
     face_cfg = _face_cfg_by_slug.get(bot_slug) or {}
     face_on = bool(face_cfg.get('face_avatar_id'))
