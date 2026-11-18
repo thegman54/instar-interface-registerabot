@@ -1791,12 +1791,21 @@ def _note_page_session(bot_slug: str, envelope: dict, voice_group_id: str = '',
         log.debug("page_sessions_save_failed", error=str(e))
 
 
-async def push_to_page(bot_slug: str, text: str, spoken: str = '') -> dict:
+async def push_to_page(bot_slug: str, text: str, spoken: str = '',
+                       sender: str = '', sender_name: str = '') -> dict:
     """Say `text` on the slug's most recent page session, with her voice when `spoken` is set.
 
     Text first, then audio (or a face render when the avatar is on), the same order a turn
     uses. The line is recorded in the gatekeeper history of that conversation so the page's
-    transcript holds it after a reload."""
+    transcript holds it after a reload.
+
+    ANOTHER PROFILE SPEAKING (instar-skill-fleet docs/FRONT_DESK_VOICES_PLAN.md, Part 2, first
+    piece). `sender` is the profile the words are from (e.g. fleet_cen_alex on Lois's page). The
+    caller stamps it from its own records; this route is internal (the fleet's announcer), never
+    reachable from a page. The line is labelled with `sender_name` and spoken in the SENDER's
+    voice, as audio only: the page's face belongs to the page's bot, and lip-syncing it to someone
+    else's voice would say the opposite of what the label says. The sender's own face is the guest
+    tile, which needs the page code (relay) and is not built yet."""
     s = _page_sessions.get(bot_slug) or {}
     envelope = s.get('envelope')
     if not envelope:
@@ -1807,6 +1816,11 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '') -> dict:
     voice_group_id = s.get('voice_group_id', '')
     face_cfg = _face_cfg_by_slug.get(bot_slug) or {}
     face_on = bool(face_cfg.get('face_avatar_id'))
+    if sender:
+        voice_group_id = (await _get_voice_group(sender)) or voice_group_id
+        face_on = False
+        label = sender_name or sender
+        text = f"{label}: {text}"
     audio_b64 = await _generate_tts(spoken, voice_group_id) if (spoken and voice_group_id) else ''
     await send_response(ws, envelope, bot_slug, text, spoken,
                         audio_base64='' if face_on else audio_b64)
@@ -1825,9 +1839,10 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '') -> dict:
         except Exception as e:                                       # noqa: BLE001
             log.warning("push_record_failed", bot=bot_slug, error=str(e)[:200])
     log.info("page_push", bot=bot_slug, session=envelope.get('session_id', ''),
-             spoken=bool(audio_b64), length=len(text))
+             spoken=bool(audio_b64), length=len(text), sender=sender or bot_slug)
     return {'delivered': True, 'session_id': envelope.get('session_id', ''),
-            'spoken': bool(audio_b64), 'page_seen_s_ago': int(time.time() - s.get('at', 0))}
+            'spoken': bool(audio_b64), 'from': sender or bot_slug,
+            'page_seen_s_ago': int(time.time() - s.get('at', 0))}
 
 
 def _live_host_ws():
@@ -2486,13 +2501,19 @@ async def disconnect_slug(slug: str):
 async def push_slug(slug: str, request: dict | None = None):
     """Say something on the slug's open page without being asked.
 
-    Body: {"text": "...", "spoken": "..." (optional, voiced)}
-    Called by the fleet when something lands in the Inbox. 409 when no page is listening."""
+    Body: {"text": "...", "spoken": "..." (optional, voiced),
+           "from": "<profile slug>" (optional), "from_name": "<label>" (optional)}
+    Called by the fleet when something lands in the Inbox. 409 when no page is listening.
+    `from` makes another profile the speaker (its voice, labelled, audio only); see push_to_page."""
     request = request or {}
     text = (request.get('text') or '').strip()
     if not text:
         return JSONResponse({"error": "text required"}, status_code=400)
-    result = await push_to_page(slug, text, (request.get('spoken') or '').strip())
+    sender = (request.get('from') or '').strip()
+    if sender and not re.fullmatch(r"[a-z0-9_]{1,64}", sender):
+        return JSONResponse({"error": "from must be a profile slug"}, status_code=400)
+    result = await push_to_page(slug, text, (request.get('spoken') or '').strip(),
+                                sender, (request.get('from_name') or '').strip()[:40])
     return JSONResponse(result, status_code=200 if result['delivered'] else 409)
 
 
