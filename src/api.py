@@ -13,6 +13,7 @@ Message flow:
 """
 
 import os
+import base64
 import json
 import asyncio
 import re
@@ -253,6 +254,7 @@ def build_response_envelope(
     spoken: str = '',
     attachments: list[dict] = None,
     audio_base64: str = '',
+    speaker: dict | None = None,
 ) -> dict:
     """
     Build an outbound envelope to send back through the relay.
@@ -267,6 +269,8 @@ def build_response_envelope(
         payload['spoken'] = spoken
     if attachments:
         payload['attachments'] = attachments
+    if speaker:
+        payload['speaker'] = speaker
     if audio_base64:
         payload['audio'] = {
             'base64': audio_base64,
@@ -374,6 +378,57 @@ async def _get_voice_group(bot_slug: str) -> str:
         log.debug("voice_group_lookup_failed", slug=bot_slug, error=str(e))
     _voice_group_cache[bot_slug] = vg
     return vg
+
+
+# WHO SAID IT, ON THE PAGE (Alex 2026-11-18: "they aren't TAGGED ... their little avatar on each
+# message"). Every reply carries `speaker` {slug, name, avatar?, owner?}; the page draws the
+# avatar on the bubble and a border in the speaker's colour (none for the page's own bot), so a
+# guest's line no longer needs a "Peter: " prefix to be told apart.
+# Which profile owns each page, for the owner's own replies. Same pairs as the fleet
+# announcer's FLEET_ANNOUNCE_SLUGS.
+PAGE_PROFILES = dict(p.split('=', 1) for p in os.environ.get(
+    'PAGE_PROFILES', 'lois=fleet_cen_lois,alex-cenora=fleet_cen_alex').split(',') if '=' in p)
+SPEAKER_NAMES = dict(p.split('=', 1) for p in os.environ.get(
+    'SPEAKER_NAMES', 'fleet_cen_alex=Peter,fleet_cen_dev=Brian,fleet_cen_lois=Lois').split(',')
+    if '=' in p)
+# profile slug -> data: URI of its avatar ('' = none). The page shrinks it to a thumbnail
+# itself (no image library in this container), and is sent each one ONCE per page session.
+_avatar_cache: dict[str, str] = {}
+_avatars_sent: dict[str, set] = {}
+
+
+async def _avatar_data_uri(profile_slug: str) -> str:
+    if profile_slug in _avatar_cache:
+        return _avatar_cache[profile_slug]
+    admin = os.environ.get('ADMIN_API_URL', 'http://gatekeeper:8090')
+    uri = ''
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{admin}/api/profiles/{profile_slug}/avatar", timeout=8.0)
+            # A page frame has a size limit; an avatar past ~400 KB is not worth the risk.
+            if r.status_code == 200 and len(r.content) <= 400_000:
+                mime = r.headers.get('content-type', 'image/png').split(';')[0]
+                uri = f"data:{mime};base64,{base64.b64encode(r.content).decode()}"
+    except Exception as e:                                           # noqa: BLE001
+        log.debug("avatar_lookup_failed", slug=profile_slug, error=str(e))
+    _avatar_cache[profile_slug] = uri
+    return uri
+
+
+async def _speaker_tag(envelope: dict, profile_slug: str, owner: bool) -> dict | None:
+    """The `speaker` for a reply on this page session, with the avatar the first time only."""
+    if not profile_slug:
+        return None
+    tag = {'slug': profile_slug, 'name': SPEAKER_NAMES.get(profile_slug, profile_slug)}
+    if owner:
+        tag['owner'] = True
+    sent = _avatars_sent.setdefault((envelope or {}).get('session_id', ''), set())
+    if profile_slug not in sent:
+        uri = await _avatar_data_uri(profile_slug)
+        if uri:
+            tag['avatar'] = uri
+        sent.add(profile_slug)
+    return tag
 
 
 def build_video_envelope(original_envelope: dict, bot_slug: str, video_base64: str,
@@ -1848,10 +1903,15 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
         face_on = bool(sender_face)
         face_cfg = {'face_avatar_id': sender_face} if sender_face else {}
         guest = {'slug': sender, 'name': label} if sender_face else None
-        text = f"{label}: {text}"
+    # The page shows who is speaking from `speaker` (avatar, colour); the history keeps the
+    # "Name: " prefix because a transcript has no avatars.
+    speaker = await _speaker_tag(envelope, sender, False) if sender else None
+    if speaker and sender_name:
+        speaker['name'] = sender_name
+    history_text = f"{label}: {text}" if sender else text
     audio_b64 = await _generate_tts(spoken, voice_group_id) if (spoken and voice_group_id) else ''
     await send_response(ws, envelope, bot_slug, text, spoken,
-                        audio_base64='' if face_on else audio_b64)
+                        audio_base64='' if face_on else audio_b64, speaker=speaker)
     if audio_b64:
         if face_on:
             asyncio.create_task(_render_and_send_video(
@@ -1863,7 +1923,7 @@ async def push_to_page(bot_slug: str, text: str, spoken: str = '',
         try:
             async with httpx.AsyncClient() as client:
                 await client.post(f"{GATEKEEPER_URL}/record-response",
-                                  json={'session_id': s['gk_session_id'], 'response': text},
+                                  json={'session_id': s['gk_session_id'], 'response': history_text},
                                   timeout=10.0)
         except Exception as e:                                       # noqa: BLE001
             log.warning("push_record_failed", bot=bot_slug, error=str(e)[:200])
@@ -1883,7 +1943,7 @@ def _live_host_ws():
         return None
 
 
-async def send_response(ws, original_envelope: dict, bot_slug: str, text: str, spoken: str = '', attachments: list[dict] = None, audio_base64: str = '') -> None:
+async def send_response(ws, original_envelope: dict, bot_slug: str, text: str, spoken: str = '', attachments: list[dict] = None, audio_base64: str = '', speaker: dict | None = None) -> None:
     """Wrap text in an envelope and send it back through the relay WebSocket.
 
     Sends on the LIVE socket, not the one the message arrived on.
@@ -1905,9 +1965,15 @@ async def send_response(ws, original_envelope: dict, bot_slug: str, text: str, s
     except Exception:                                            # noqa: BLE001
         pass
 
+    # The page's own bot, unless the caller named someone else (a guest's push).
+    if speaker is None:
+        try:
+            speaker = await _speaker_tag(original_envelope, PAGE_PROFILES.get(bot_slug, ''), True)
+        except Exception:                                        # noqa: BLE001
+            speaker = None
     response_envelope = build_response_envelope(
         original_envelope, bot_slug, text, spoken,
-        attachments=attachments, audio_base64=audio_base64,
+        attachments=attachments, audio_base64=audio_base64, speaker=speaker,
     )
     payload = json.dumps(response_envelope)
 
